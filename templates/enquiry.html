@@ -1,0 +1,695 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enquiry & Estimation Details</title>
+    <!-- Font Awesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <!-- Google Fonts for typography -->
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        /* === Variables for Theming === */
+        :root {
+            --color-bg-dark: #0a192f;
+            --color-bg-medium: #112240;
+            --color-card-default: #1c3a60;
+            --color-card-hover: #223a70;
+            --color-accent: #64ffda;
+            --color-primary: #0066cc;
+            --color-text: #e6f1ff;
+            --color-subtle: #8892b0;
+            --color-success: #28a745;
+        }
+
+        body {
+            font-family: 'Fira Sans', "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, var(--color-bg-dark), var(--color-bg-medium));
+            color: var(--color-text);
+            text-align: center;
+            padding: 30px 10px;
+            margin: 0;
+            min-height: 100vh;
+        }
+
+        /* --- Header and Navigation --- */
+        .header-section {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            max-width: 1200px;
+            margin: 0 auto 30px;
+            padding: 0 20px;
+        }
+
+        .back-link {
+            font-size: 1rem;
+            color: var(--color-accent);
+            text-decoration: none;
+            transition: color 0.3s ease;
+        }
+
+        .back-link:hover {
+            color: var(--color-text);
+            text-decoration: underline;
+        }
+
+        h1 {
+            color: var(--color-accent);
+            font-size: clamp(1.8rem, 4vw, 2.5rem);
+            font-weight: 800;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+            margin: 0;
+        }
+
+        .subtitle {
+            color: var(--color-subtle);
+            margin-bottom: 30px;
+            font-size: 1.1rem;
+        }
+
+        /* --- Success Banner Styling --- */
+        #success-banner {
+            display: none;
+            max-width: 80%;
+            margin: 20px auto;
+            padding: 15px;
+            background: var(--color-success);
+            color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4);
+            font-weight: 600;
+            animation: fadeIn 0.5s ease-out;
+        }
+
+
+        /* --- Controls --- */
+        .controls-card {
+            background: var(--color-card-default);
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.4);
+            margin: 0 auto 30px;
+            max-width: 500px;
+            transition: all 0.3s ease;
+        }
+
+        .button-row {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .button-row form {
+            margin: 0;
+        }
+
+        .action-button {
+            background: var(--color-primary);
+            color: var(--color-text);
+            border: none;
+            padding: 12px 28px;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 6px;
+            cursor: pointer;
+            margin: 5px 0;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .action-button:hover {
+            background: var(--color-accent);
+            color: var(--color-bg-dark);
+            transform: translateY(-2px);
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.5);
+        }
+
+        .process-button {
+            background: var(--color-accent);
+            color: var(--color-bg-dark);
+        }
+
+        .process-button:hover {
+            background: var(--color-text);
+        }
+
+        /* --- Table Styling --- */
+        .table-container {
+            max-width: 98%;
+            margin: 20px auto 40px;
+            overflow-x: auto;
+        }
+
+        .data-table {
+            width: 100%;
+            min-width: 1500px;
+            border-collapse: collapse;
+            background: var(--color-card-default);
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.4);
+            border-radius: 12px;
+            overflow: hidden;
+            margin: 0 auto;
+        }
+
+        .data-table th,
+        .data-table td {
+            padding: 15px;
+            border: none;
+            text-align: left;
+        }
+
+        .data-table th {
+            background: var(--color-primary);
+            color: var(--color-text);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.9rem;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--color-accent);
+        }
+
+        .data-table tr:nth-child(even) {
+            background: var(--color-bg-medium);
+        }
+
+        .data-table tbody tr:hover {
+            background: var(--color-card-hover);
+            transition: 0.3s;
+        }
+
+        .data-table td {
+            white-space: nowrap;
+        }
+
+        .table-toolbar,
+        .table-pagination {
+            max-width: 98%;
+            margin: 12px auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            text-align: left;
+        }
+
+        .table-toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--color-text);
+            font-weight: 600;
+        }
+
+        .table-filter,
+        .table-page-size {
+            box-sizing: border-box;
+            border: 1px solid var(--color-subtle);
+            border-radius: 6px;
+            background: var(--color-bg-medium);
+            color: var(--color-text);
+            padding: 9px 11px;
+            font: inherit;
+        }
+
+        .table-filter {
+            width: min(360px, 70vw);
+        }
+
+        .table-filter:focus,
+        .table-page-size:focus {
+            border-color: var(--color-accent);
+            outline: 2px solid rgba(100, 255, 218, 0.25);
+        }
+
+        .table-container.has-table-controls {
+            margin-top: 12px;
+            margin-bottom: 12px;
+        }
+
+        .table-page-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .table-page-button {
+            border: 1px solid var(--color-accent);
+            border-radius: 6px;
+            background: var(--color-primary);
+            color: var(--color-text);
+            padding: 8px 14px;
+            font: inherit;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .table-page-button:disabled {
+            border-color: var(--color-subtle);
+            background: var(--color-bg-medium);
+            color: var(--color-subtle);
+            cursor: not-allowed;
+        }
+
+        .table-page-info,
+        .table-no-results {
+            color: var(--color-subtle);
+        }
+
+        .table-no-results {
+            max-width: 98%;
+            margin: 12px auto;
+            text-align: left;
+        }
+
+        .report-heading {
+            color: var(--color-accent);
+            margin: 38px 0 8px;
+            font-size: 1.6rem;
+        }
+
+        .report-count {
+            color: var(--color-subtle);
+            margin: 0 0 12px;
+        }
+
+        .empty-state,
+        .error-message {
+            max-width: 900px;
+            margin: 20px auto;
+            padding: 18px;
+            border-radius: 8px;
+            background: var(--color-card-default);
+        }
+
+        /* --- General Animations --- */
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+
+            to {
+                opacity: 1;
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @media (max-width: 640px) {
+            .table-toolbar,
+            .table-pagination {
+                align-items: stretch;
+                flex-direction: column;
+            }
+
+            .table-toolbar label {
+                justify-content: space-between;
+            }
+
+            .table-filter {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header-section">
+        <a href="{{ url_for('dashboard') }}" class="back-link" aria-label="Back to Dashboard">
+            <i class="fas fa-arrow-circle-left"></i> Back to Dashboard
+        </a>
+        <h1><i class="fas fa-file-invoice"></i> Enquiry Details</h1>
+        <span>&nbsp;</span>
+    </div>
+
+    <p class="subtitle">View existing cost estimations and fetch document matching details.</p>
+
+    <!-- Success Banner (Hidden by default) -->
+    <div id="success-banner">
+        <i class="fas fa-check-circle me-2"></i>
+        <span id="success-message">Processing completed successfully!</span>
+    </div>
+
+    <!-- Controls (ONLY Fetch and Navigation retained) -->
+    <div class="controls-card">
+        <div class="button-row">
+            <!-- Fetch Details Button (Menu 1, Step 1) -->
+            <form action="{{ url_for('fetch_details') }}" method="GET">
+                <button type="submit" class="action-button">
+                    <i class="fas fa-search"></i> Fetch Details (DB Load)
+                </button>
+            </form>
+
+            <!-- Navigation to dedicated Uploader -->
+            <a href="{{ url_for('upload_files') }}">
+                <button type="button" class="action-button process-button">
+                    <i class="fas fa-upload"></i> Go to Batch Uploader
+                </button>
+            </a>
+        </div>
+    </div>
+
+    {% if error %}
+    <div class="error-message">
+        <i class="fas fa-triangle-exclamation"></i>
+        Database error: {{ error }}
+    </div>
+    {% endif %}
+
+    {% if loaded %}
+    <section>
+        <h2 class="report-heading">
+            <i class="fas fa-table"></i> All Regular Order Estimations
+        </h2>
+        <p class="report-count">
+            {{ details|length }} estimation number(s) from REGULARORDER
+        </p>
+
+        {% if details %}
+        <div class="table-container">
+            <table class="data-table" data-table-controls data-table-label="regular order estimations">
+                <thead>
+                    <tr>
+                        <th>Est No</th>
+                        <th>Est Date</th>
+                        <th>Regular Order No</th>
+                        <th>Mixing Sheet</th>
+                        <th>Est Sheet</th>
+                        <th>PO Document</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in details %}
+                    <tr>
+                        <td>{{ row.est_no if row.est_no is not none else '-' }}</td>
+                        <td>{{ row.est_date if row.est_date is not none else '-' }}</td>
+                        <td>{{ row.regular_orders }}</td>
+                        <td>{{ row.mixingsheet }}</td>
+                        <td>{{ row.estsheet }}</td>
+                        <td>{{ row.po_matching_file }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">
+            No estimation numbers were found in REGULARORDER.
+        </div>
+        {% endif %}
+    </section>
+
+    <section>
+        <h2 class="report-heading">
+            <i class="fas fa-file-lines"></i> Est Sheet Attachment Pending
+        </h2>
+        <p class="report-count">{{ est_pending|length }} pending estimation(s)</p>
+
+        {% if est_pending %}
+        <div class="table-container">
+            <table class="data-table" data-table-controls data-table-label="EST Sheet pending attachments">
+                <thead>
+                    <tr>
+                        <th>Est No</th>
+                        <th>Est Date</th>
+                        <th>Required Qty</th>
+                        <th>Booking Rate</th>
+                        <th>Auth Date</th>
+                        <th>Party</th>
+                        <th>Count</th>
+                        <th>Reference Type</th>
+                        <th>Reference No</th>
+                        <th>Representative</th>
+                        <th>Delay Days</th>
+                        <th>IA Cancel Remarks</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in est_pending %}
+                    <tr>
+                        <td>{{ row.estno if row.estno is not none else '-' }}</td>
+                        <td>{{ row.estdate if row.estdate is not none else '-' }}</td>
+                        <td>{{ row.req_qty if row.req_qty is not none else '-' }}</td>
+                        <td>{{ row.bookingrate if row.bookingrate is not none else '-' }}</td>
+                        <td>{{ row.authdate if row.authdate is not none else '-' }}</td>
+                        <td>{{ row.partyname if row.partyname is not none else '-' }}</td>
+                        <td>{{ row.countname if row.countname is not none else '-' }}</td>
+                        <td>{{ row.refrencetype if row.refrencetype is not none else '-' }}</td>
+                        <td>{{ row.refrenceno if row.refrenceno is not none else '-' }}</td>
+                        <td>{{ row.repname if row.repname is not none else '-' }}</td>
+                        <td>{{ row.delaydays if row.delaydays is not none else '-' }}</td>
+                        <td>{{ row.iacancelremarks if row.iacancelremarks is not none else '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">No EST Sheet attachments are pending.</div>
+        {% endif %}
+    </section>
+
+    <section>
+        <h2 class="report-heading">
+            <i class="fas fa-layer-group"></i> Mixing Sheet Attachment Pending
+        </h2>
+        <p class="report-count">{{ mix_pending|length }} pending estimation(s)</p>
+
+        {% if mix_pending %}
+        <div class="table-container">
+            <table class="data-table" data-table-controls data-table-label="Mixing Sheet pending attachments">
+                <thead>
+                    <tr>
+                        <th>Est No</th>
+                        <th>Est Date</th>
+                        <th>Required Qty</th>
+                        <th>Booking Rate</th>
+                        <th>Auth Date</th>
+                        <th>Party</th>
+                        <th>Count</th>
+                        <th>Reference Type</th>
+                        <th>Reference No</th>
+                        <th>Representative</th>
+                        <th>Delay Days</th>
+                        <th>IA Cancel Remarks</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in mix_pending %}
+                    <tr>
+                        <td>{{ row.estno if row.estno is not none else '-' }}</td>
+                        <td>{{ row.estdate if row.estdate is not none else '-' }}</td>
+                        <td>{{ row.req_qty if row.req_qty is not none else '-' }}</td>
+                        <td>{{ row.bookingrate if row.bookingrate is not none else '-' }}</td>
+                        <td>{{ row.authdate if row.authdate is not none else '-' }}</td>
+                        <td>{{ row.partyname if row.partyname is not none else '-' }}</td>
+                        <td>{{ row.countname if row.countname is not none else '-' }}</td>
+                        <td>{{ row.refrencetype if row.refrencetype is not none else '-' }}</td>
+                        <td>{{ row.refrenceno if row.refrenceno is not none else '-' }}</td>
+                        <td>{{ row.repname if row.repname is not none else '-' }}</td>
+                        <td>{{ row.delaydays if row.delaydays is not none else '-' }}</td>
+                        <td>{{ row.iacancelremarks if row.iacancelremarks is not none else '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="empty-state">No Mixing Sheet attachments are pending.</div>
+        {% endif %}
+    </section>
+    {% else %}
+    <div style="padding: 50px; color: var(--color-subtle);">
+        <i class="fas fa-info-circle" style="font-size: 2rem; margin-bottom: 10px;"></i>
+        <p>
+            Click 'Fetch Details' to load every REGULARORDER estimation
+            plus pending EST and Mixing Sheet attachments.
+        </p>
+    </div>
+    {% endif %}
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function () {
+            const DEFAULT_PAGE_LENGTH = 20;
+
+            function setupTableControls(table) {
+                const body = table.tBodies[0];
+                const rows = body ? Array.from(body.rows) : [];
+
+                if (!rows.length) {
+                    return;
+                }
+
+                const tableWrap = table.closest('.table-container');
+                const tableLabel = table.dataset.tableLabel || 'table';
+                let currentPage = 1;
+                let pageLength = DEFAULT_PAGE_LENGTH;
+                let filterText = '';
+
+                tableWrap.classList.add('has-table-controls');
+
+                const toolbar = document.createElement('div');
+                toolbar.className = 'table-toolbar';
+                toolbar.innerHTML = `
+                    <label>
+                        Filter:
+                        <input class="table-filter" type="search"
+                            placeholder="Search ${tableLabel}" autocomplete="off">
+                    </label>
+                    <label>
+                        Rows:
+                        <select class="table-page-size">
+                            <option value="10">10</option>
+                            <option value="20" selected>20</option>
+                            <option value="50">50</option>
+                            <option value="100">100</option>
+                            <option value="0">All</option>
+                        </select>
+                    </label>
+                `;
+
+                const noResults = document.createElement('p');
+                noResults.className = 'table-no-results';
+                noResults.textContent = 'No rows match this filter.';
+                noResults.hidden = true;
+
+                const pagination = document.createElement('div');
+                pagination.className = 'table-pagination';
+                pagination.innerHTML = `
+                    <span class="table-page-info" aria-live="polite"></span>
+                    <div class="table-page-buttons">
+                        <button class="table-page-button table-previous" type="button">Previous</button>
+                        <button class="table-page-button table-next" type="button">Next</button>
+                    </div>
+                `;
+
+                tableWrap.before(toolbar);
+                tableWrap.after(noResults, pagination);
+
+                const filterInput = toolbar.querySelector('.table-filter');
+                const pageSizeSelect = toolbar.querySelector('.table-page-size');
+                const pageInfo = pagination.querySelector('.table-page-info');
+                const previousButton = pagination.querySelector('.table-previous');
+                const nextButton = pagination.querySelector('.table-next');
+
+                filterInput.setAttribute('aria-label', `Filter ${tableLabel}`);
+                pageSizeSelect.setAttribute('aria-label', `Rows per page for ${tableLabel}`);
+
+                function renderTable() {
+                    const matchingRows = rows.filter((row) =>
+                        row.textContent.toLocaleLowerCase().includes(filterText)
+                    );
+                    const totalPages = pageLength === 0
+                        ? 1
+                        : Math.max(1, Math.ceil(matchingRows.length / pageLength));
+
+                    currentPage = Math.min(currentPage, totalPages);
+
+                    const startIndex = pageLength === 0
+                        ? 0
+                        : (currentPage - 1) * pageLength;
+                    const endIndex = pageLength === 0
+                        ? matchingRows.length
+                        : Math.min(startIndex + pageLength, matchingRows.length);
+                    const visibleRows = new Set(
+                        matchingRows.slice(startIndex, endIndex)
+                    );
+
+                    rows.forEach((row) => {
+                        row.hidden = !visibleRows.has(row);
+                    });
+
+                    noResults.hidden = matchingRows.length !== 0;
+                    previousButton.disabled = currentPage <= 1;
+                    nextButton.disabled = currentPage >= totalPages;
+
+                    if (!matchingRows.length) {
+                        pageInfo.textContent = `0 matching rows (${rows.length} total)`;
+                    } else {
+                        const totalText = matchingRows.length === rows.length
+                            ? ''
+                            : ` (${rows.length} total)`;
+                        pageInfo.textContent =
+                            `Showing ${startIndex + 1}-${endIndex} of ${matchingRows.length}${totalText}`;
+                    }
+                }
+
+                filterInput.addEventListener('input', function () {
+                    filterText = this.value.trim().toLocaleLowerCase();
+                    currentPage = 1;
+                    renderTable();
+                });
+
+                pageSizeSelect.addEventListener('change', function () {
+                    pageLength = Number.parseInt(this.value, 10);
+                    currentPage = 1;
+                    renderTable();
+                });
+
+                previousButton.addEventListener('click', function () {
+                    if (currentPage > 1) {
+                        currentPage -= 1;
+                        renderTable();
+                    }
+                });
+
+                nextButton.addEventListener('click', function () {
+                    const matchingCount = rows.filter((row) =>
+                        row.textContent.toLocaleLowerCase().includes(filterText)
+                    ).length;
+                    const totalPages = pageLength === 0
+                        ? 1
+                        : Math.max(1, Math.ceil(matchingCount / pageLength));
+
+                    if (currentPage < totalPages) {
+                        currentPage += 1;
+                        renderTable();
+                    }
+                });
+
+                renderTable();
+            }
+
+            document.querySelectorAll('table[data-table-controls]')
+                .forEach(setupTableControls);
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const status = urlParams.get('status');
+            const matches = urlParams.get('matches');
+            const banner = document.getElementById('success-banner');
+            const message = document.getElementById('success-message');
+
+            if (status === 'success') {
+                let matchText = matches ? `${matches} document set(s)` : `files`;
+                message.textContent = `Processing successful! Found and processed data for ${matchText}.`;
+                banner.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+
+</html>

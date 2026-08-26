@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard | Document Processor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <style>
+        /* === Variables for Theming === */
+        :root {
+            --color-bg-dark: #0a192f;
+            --color-bg-medium: #112240;
+            --color-card-default: #1c3a60;
+            --color-card-hover: #2a4970;
+            --color-accent: #64ffda;
+            --color-text: #e6f1ff;
+            --color-subtle: #8892b0;
+        }
+
+        body {
+            font-family: 'Fira Sans', "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, var(--color-bg-dark), var(--color-bg-medium));
+            color: var(--color-text);
+            text-align: center;
+            padding: 8vh 5vw;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            overflow-x: hidden;
+        }
+
+        h1 {
+            color: var(--color-accent);
+            margin-bottom: 80px;
+            /* Increased margin for better separation */
+            font-size: clamp(2rem, 5vw, 3.5rem);
+            letter-spacing: 2px;
+            text-shadow: 0 4px 15px rgba(0, 0, 0, 0.7);
+            font-weight: 800;
+            animation: fadeInDown 1.2s ease-out;
+        }
+
+        .card-container {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 36px;
+            /* Increased gap between cards */
+            max-width: 1280px;
+        }
+
+        .card {
+            flex: 0 0 330px;
+            /* Fixed width for better appearance with only two cards */
+            padding: 50px 40px;
+            /* Increased padding */
+            background: var(--color-card-default);
+            border-radius: 18px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
+            transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+            transform: translateY(0);
+            animation: fadeInUp 1.4s ease-out;
+            border-bottom: 4px solid var(--color-accent);
+        }
+
+        .card:hover {
+            transform: translateY(-12px) scale(1.03);
+            box-shadow: 0 16px 30px rgba(0, 0, 0, 0.7);
+            background: var(--color-card-hover);
+            border-bottom-color: var(--color-text);
+            /* Changes accent color on hover */
+        }
+
+        .card-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-decoration: none;
+            color: var(--color-text);
+        }
+
+        .card-content i {
+            font-size: 4rem;
+            /* Larger icon */
+            color: var(--color-accent);
+            margin-bottom: 25px;
+            transition: color 0.3s ease;
+        }
+
+        .card:hover .card-content i {
+            color: var(--color-text);
+        }
+
+        .card-content span {
+            font-size: 1.6rem;
+            font-weight: 600;
+            display: block;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        /* --- Animations --- */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* --- Media Query for Mobile --- */
+        @media (max-width: 768px) {
+            .card {
+                flex: 0 0 85%;
+                /* Make cards full width on small screens */
+                max-width: 90%;
+            }
+
+            .card-container {
+                gap: 30px;
+            }
+
+            h1 {
+                margin-bottom: 50px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <h1><i class="fas fa-cubes me-3"></i> Document Processing Dashboard</h1>
+    <div class="card-container">
+
+
+        <div class="card">
+            <a href="{{ url_for('estimation') }}" class="card-content">
+                <i class="fas fa-cloud-upload-alt"></i>
+                <span>Batch Document Uploader</span>
+            </a>
+        </div>
+
+        <div class="card">
+            <a href="{{ url_for('regularorder') }}" class="card-content">
+                <i class="fas fa-file-circle-exclamation"></i>
+                <span>Pending Documents</span>
+            </a>
+        </div>
+
+    </div>
+</body>
+
+</html>

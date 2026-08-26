@@ -1,0 +1,72 @@
+# Secrets and configuration
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Runtime/generated files
+logs/
+backups/
+backup*/
+uploads/
+upload/
+instance/
+tmp/
+*.log
+*.sqlite*
+*_result.json
+content_understanding_result*.json
+po_validation*.json
+
+# Confidential/test documents
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.zip
+*.tar.gz
+
+# Editors and dependencies
+.idea/
+.vscode/
+node_modules/
+instantclient*/
+.DS_Store
+
+# Historical source copies
+*.backup*
+*.bak*
+*.before*
+*backup*/
+
+# Diagnostic/generated data
+*.csv
+gst_v3_test_results/
+*_test_results/
+test_results/
+results/
+*_content.json
+*_validation.json
+*_report.json
+
+# Local diagnostic scripts
+azure_test.py
+backend_ocr_lm_test.py
+combined_po_extraction_test*.py
+content_understanding_test.py
+extract_est_est_no.py
+extract_mix_est_no.py
+extract_po_est_no.py
+fix_po_stamp_backend_v1.py
+gst_rate_validation_test_v1.py
+po_oracle_validation_test*.py

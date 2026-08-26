@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Batch Document Uploader</title>
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;600;800&display=swap" rel="stylesheet">
+
+
+    <style>
+        /* === Custom Variables === */
+        :root {
+            --color-primary: #0d6efd;
+            --color-secondary: #0088aa;
+            --color-light-bg: #f5faff;
+            --color-white: #ffffff;
+            --color-text-dark: #2c3e50;
+            --color-success: #198754;
+            /* Theme colors matching dashboard */
+            --color-bg-dark: #0a192f;
+            --color-bg-medium: #112240;
+            --color-card-default: #1c3a60;
+            --color-accent: #64ffda;
+            --color-text-light: #e6f1ff;
+        }
+
+        body {
+            font-family: 'Fira Sans', "Segoe UI", sans-serif;
+            /* Using darker theme to match dashboard */
+            background: linear-gradient(135deg, var(--color-bg-dark), var(--color-bg-medium));
+            color: var(--color-text-light);
+            min-height: 100vh;
+            text-align: center;
+        }
+
+        /* Back to Dashboard Link */
+        .back-link {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 1rem;
+            color: var(--color-accent);
+            text-decoration: none;
+            transition: color 0.3s ease;
+            font-weight: 500;
+        }
+
+        .back-link:hover {
+            color: var(--color-text-light);
+        }
+
+        /* --- Main Card --- */
+        .upload-card {
+            max-width: 1100px;
+            margin: 80px auto 40px;
+            padding: 40px;
+            border-radius: 25px;
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.4);
+            background-color: var(--color-card-default);
+            border-top: 5px solid var(--color-accent);
+            animation: fadeIn 0.8s ease-out;
+            color: var(--color-text-light);
+            /* Ensure card content is readable */
+        }
+
+        h3 {
+            color: var(--color-accent);
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px !important;
+        }
+
+        .icon-lg {
+            font-size: 3.5rem;
+            color: var(--color-accent);
+            margin-bottom: 10px;
+        }
+
+        /* --- Drop Area --- */
+        .drop-area {
+            border: 3px dashed var(--color-primary);
+            border-radius: 15px;
+            padding: 50px 30px;
+            text-align: center;
+            color: var(--color-accent);
+            transition: all 0.3s ease-in-out;
+            background: var(--color-bg-medium);
+            cursor: pointer;
+        }
+
+        .drop-area.dragover {
+            background-color: #1a3055;
+            transform: scale(1.01);
+            border-color: var(--color-accent);
+            box-shadow: 0 0 10px rgba(100, 255, 218, 0.5);
+        }
+
+        .drop-area p {
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: var(--color-text-light);
+        }
+
+        .drop-area small {
+            color: var(--color-primary);
+            font-weight: 500;
+        }
+
+        /* Custom Button Styling */
+        .btn-outline-primary {
+            border-width: 2px !important;
+            font-weight: 600;
+            transition: all 0.3s;
+            color: var(--color-accent);
+            border-color: var(--color-accent);
+        }
+
+        .btn-outline-primary:hover {
+            background-color: var(--color-accent);
+            color: var(--color-bg-dark);
+            border-color: var(--color-accent);
+        }
+
+
+        /* --- Progress Bar --- */
+        #progressContainer {
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            overflow: hidden;
+            background-color: var(--color-bg-medium);
+        }
+
+        #progressBar {
+            transition: width 0.4s ease;
+        }
+
+        .file-list {
+            display: grid;
+            gap: 14px;
+            margin-top: 20px;
+            text-align: left;
+        }
+
+        .file-item {
+            border: 1px solid rgba(100, 255, 218, 0.22);
+            border-radius: 14px;
+            background: rgba(10, 25, 47, 0.55);
+            padding: 16px;
+        }
+
+        .file-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+
+        .file-name {
+            color: var(--color-text-light);
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .file-name i {
+            color: #ff6b6b;
+            margin-right: 8px;
+        }
+
+        .file-outcome {
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            background: rgba(255, 255, 255, 0.08);
+            white-space: nowrap;
+        }
+
+        .file-outcome.inserted { color: #66f2b3; }
+        .file-outcome.validated { color: #74c0fc; }
+        .file-outcome.processing { color: #74c0fc; }
+        .file-outcome.review { color: #ffd43b; }
+        .file-outcome.failed { color: #ff8787; }
+        .file-outcome.skipped { color: #ced4da; }
+
+        .workflow-steps {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(125px, 1fr));
+            gap: 8px;
+        }
+
+        .workflow-step {
+            min-height: 82px;
+            border-radius: 10px;
+            padding: 10px;
+            background: rgba(17, 34, 64, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .workflow-step-icon {
+            display: block;
+            font-size: 1.1rem;
+            margin-bottom: 4px;
+        }
+
+        .workflow-step-label {
+            display: block;
+            font-size: 0.78rem;
+            font-weight: 700;
+        }
+
+        .workflow-step-message {
+            display: block;
+            margin-top: 3px;
+            color: #a8b2c1;
+            font-size: 0.69rem;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+        }
+
+        .workflow-step.completed {
+            border-color: rgba(25, 135, 84, 0.8);
+            color: #66f2b3;
+        }
+
+        .workflow-step.processing {
+            border-color: rgba(13, 110, 253, 0.9);
+            color: #74c0fc;
+        }
+
+        .workflow-step.review_required {
+            border-color: rgba(255, 193, 7, 0.9);
+            color: #ffd43b;
+        }
+
+        .workflow-step.failed {
+            border-color: rgba(220, 53, 69, 0.9);
+            color: #ff8787;
+        }
+
+        .workflow-step.blocked,
+        .workflow-step.skipped,
+        .workflow-step.not_applicable {
+            color: #adb5bd;
+            opacity: 0.86;
+        }
+
+        .file-result-details {
+            display: none;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            color: #d9e2ef;
+            font-size: 0.78rem;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+
+        .file-result-details.visible { display: block; }
+
+        .mode-banner {
+            margin: 0 auto 18px;
+            border-radius: 10px;
+            padding: 10px 14px;
+            font-size: 0.86rem;
+            font-weight: 600;
+        }
+
+        .mode-banner.read-only {
+            color: #b6e3ff;
+            background: rgba(13, 110, 253, 0.16);
+            border: 1px solid rgba(116, 192, 252, 0.55);
+        }
+
+        .mode-banner.live {
+            color: #ffe8a1;
+            background: rgba(255, 193, 7, 0.14);
+            border: 1px solid rgba(255, 193, 7, 0.55);
+        }
+
+        @media (max-width: 900px) {
+            .workflow-steps {
+                grid-template-columns: repeat(2, minmax(130px, 1fr));
+            }
+        }
+
+        @media (max-width: 520px) {
+            .upload-card {
+                margin: 65px 10px 30px;
+                padding: 24px 14px;
+            }
+
+            .workflow-steps { grid-template-columns: 1fr; }
+            .file-item-header { align-items: flex-start; }
+        }
+
+        /* --- Upload Button --- */
+        #uploadBtn {
+            display: none;
+            font-size: 1.1rem;
+            padding: 12px 30px;
+            background-color: var(--color-primary);
+            border-color: var(--color-primary);
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        #uploadBtn:hover {
+            background-color: var(--color-secondary);
+            border-color: var(--color-secondary);
+        }
+
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(25px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <a href="{{ url_for('dashboard') }}" class="back-link" aria-label="Back to Dashboard">
+        <i class="fas fa-arrow-circle-left"></i> Back
+    </a>
+
+    <div class="upload-card shadow-sm">
+        <h3 class="text-center mb-1">
+            <i class="fas fa-folder-open icon-lg"></i>
+        </h3>
+        <h3 class="text-center mb-4">
+            Batch Document Uploader
+        </h3>
+
+        {% if batch_insert_enabled %}
+        <div class="mode-banner live">
+            <i class="fas fa-database"></i>
+            Live insert mode — validated documents can be written to Oracle.
+        </div>
+        {% else %}
+        <div class="mode-banner read-only">
+            <i class="fas fa-shield-alt"></i>
+            Read-only mode — documents are checked, but nothing is inserted.
+        </div>
+        {% endif %}
+
+        <!-- Drag and drop area -->
+        <div class="drop-area" id="drop-area">
+            <p class="mb-1">Drag and drop your folder here</p>
+            <small class="text-muted">Each PDF is processed and reported separately.</small>
+            <br><br>
+            <label class="btn btn-outline-primary custom-btn">
+                <i class="bi bi-folder-fill"></i> Select Folder
+                <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+            </label>
+        </div>
+
+        <!-- File Count -->
+        <div id="fileCountDisplay" class="mt-3 text-center fw-bold text-primary"></div>
+
+        <!-- Selected files -->
+        <div class="file-list" id="fileList">
+            <div class="text-center text-muted p-2">No files selected.</div>
+        </div>
+
+        <!-- Progress bar -->
+        <div class="progress mt-3" style="height: 10px; display:none;" id="progressContainer">
+            <div id="progressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar"
+                style="width: 0%; background-color: var(--color-accent) !important;"></div>
+        </div>
+
+        <!-- Upload button -->
+        <div class="text-center mt-4">
+            <button id="uploadBtn" class="btn btn-primary">
+                <i class="bi bi-cloud-arrow-up"></i> Start Processing
+            </button>
+        </div>
+    </div>
+
+    <!-- Bootstrap Toast for alerts -->
+    <div class="position-fixed bottom-0 end-0 p-3" style="z-index: 11">
+        <div id="toastMsg" class="toast align-items-center text-white bg-success border-0" role="alert"
+            aria-live="assertive" aria-atomic="true">
+            <div class="d-flex">
+                <div class="toast-body" id="toastBody">Processing finished!</div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const INFO_NO_FILE = '<div class="text-center text-muted p-2">No files selected.</div>';
+        const WORKFLOW_STAGES = [
+            ['uploaded', 'Uploaded'],
+            ['ocr', 'OCR'],
+            ['content_understanding', 'Content Understanding'],
+            ['validation', 'PO Details Ready'],
+            ['database_insert', 'Database Insert']
+        ];
+        const STATUS_ICONS = {
+            pending: 'far fa-clock',
+            processing: 'fas fa-spinner fa-spin',
+            completed: 'fas fa-check-circle',
+            review_required: 'fas fa-exclamation-triangle',
+            failed: 'fas fa-times-circle',
+            blocked: 'fas fa-lock',
+            skipped: 'fas fa-minus-circle',
+            not_applicable: 'fas fa-minus-circle'
+        };
+
+        const dropArea = document.getElementById("drop-area");
+        const folderInput = document.getElementById("folderInput");
+        const fileCountDisplay = document.getElementById("fileCountDisplay");
+        const fileList = document.getElementById("fileList");
+        const uploadBtn = document.getElementById("uploadBtn");
+        const toastEl = document.getElementById('toastMsg');
+        const toastMsg = new bootstrap.Toast(toastEl);
+        const toastBody = document.getElementById('toastBody');
+        const progressContainer = document.getElementById("progressContainer");
+        const progressBar = document.getElementById("progressBar");
+
+        let validFiles = [];
+        const fileRows = new Map();
+
+        const createStage = (stageName, label) => {
+            const stage = document.createElement('div');
+            stage.className = 'workflow-step pending';
+            stage.dataset.stage = stageName;
+
+            const icon = document.createElement('i');
+            icon.className = `workflow-step-icon ${STATUS_ICONS.pending}`;
+
+            const labelElement = document.createElement('span');
+            labelElement.className = 'workflow-step-label';
+            labelElement.textContent = label;
+
+            const message = document.createElement('span');
+            message.className = 'workflow-step-message';
+            message.textContent = 'Waiting';
+
+            stage.append(icon, labelElement, message);
+            return stage;
+        };
+
+        const createFileRow = (file, index) => {
+            const row = document.createElement('div');
+            row.className = 'file-item';
+            row.dataset.fileIndex = String(index);
+
+            const header = document.createElement('div');
+            header.className = 'file-item-header';
+
+            const name = document.createElement('div');
+            name.className = 'file-name';
+            const icon = document.createElement('i');
+            icon.className = 'fas fa-file-pdf';
+            const nameText = document.createElement('span');
+            nameText.textContent = file.name;
+            name.append(icon, nameText);
+
+            const outcome = document.createElement('span');
+            outcome.className = 'file-outcome';
+            outcome.textContent = 'Waiting';
+            outcome.dataset.role = 'outcome';
+            header.append(name, outcome);
+
+            const steps = document.createElement('div');
+            steps.className = 'workflow-steps';
+            WORKFLOW_STAGES.forEach(([stageName, label]) => {
+                steps.appendChild(createStage(stageName, label));
+            });
+
+            const details = document.createElement('div');
+            details.className = 'file-result-details';
+            details.dataset.role = 'details';
+
+            row.append(header, steps, details);
+            return row;
+        };
+
+        const updateStage = (row, stageName, stageData = {}) => {
+            const stage = row.querySelector(`[data-stage="${stageName}"]`);
+            if (!stage) return;
+
+            const status = stageData.status || 'pending';
+            stage.className = `workflow-step ${status}`;
+
+            const icon = stage.querySelector('.workflow-step-icon');
+            icon.className = `workflow-step-icon ${STATUS_ICONS[status] || STATUS_ICONS.pending}`;
+
+            const message = stage.querySelector('.workflow-step-message');
+            message.textContent = stageData.message || 'Waiting';
+            message.title = message.textContent;
+        };
+
+        const applyWorkflow = (row, workflow = {}) => {
+            WORKFLOW_STAGES.forEach(([stageName]) => {
+                updateStage(row, stageName, workflow[stageName] || {});
+            });
+        };
+
+        const setOutcome = (row, text, className) => {
+            const outcome = row.querySelector('[data-role="outcome"]');
+            outcome.textContent = text;
+            outcome.className = `file-outcome ${className || ''}`.trim();
+        };
+
+        const showDetails = (row, lines) => {
+            const details = row.querySelector('[data-role="details"]');
+            details.replaceChildren();
+            lines.filter(Boolean).forEach(line => {
+                const item = document.createElement('div');
+                item.textContent = line;
+                details.appendChild(item);
+            });
+            details.classList.toggle('visible', details.childElementCount > 0);
+        };
+
+        const resultDetailLines = (item, fallbackMessage) => {
+            if (!item) return [fallbackMessage];
+
+            const lines = [];
+            const mappings = Array.isArray(item.estimation_order_mappings)
+                ? item.estimation_order_mappings.map(mapping => (
+                    `EST ${mapping.estimation_no} → ${mapping.regular_order_number}`
+                ))
+                : [];
+            if (mappings.length) lines.push(`EST mapping: ${mappings.join(', ')}`);
+
+            const replacedOrders = Array.isArray(item.replaced_order_numbers)
+                ? item.replaced_order_numbers
+                : [];
+            if (replacedOrders.length) {
+                lines.push(
+                    `Replaced existing PO order(s): ${replacedOrders.join(', ')}`
+                );
+            }
+
+            if (Number.isInteger(item.old_detail_rows_deleted)
+                && item.old_detail_rows_deleted > 0) {
+                lines.push(
+                    `Old PO detail row(s) removed: ${item.old_detail_rows_deleted}`
+                );
+            }
+
+            const estimationNumbers = item.inserted_estimation_numbers || item.estimation_numbers || [];
+            if (!mappings.length && estimationNumbers.length) {
+                lines.push(`EST number(s): ${estimationNumbers.join(', ')}`);
+            }
+
+            if (Array.isArray(item.docids) && item.docids.length) {
+                lines.push(`DOCID(s): ${item.docids.join(', ')}`);
+            } else if (item.docid) {
+                lines.push(`DOCID: ${item.docid}`);
+            }
+
+            if (Number.isInteger(item.po_detail_rows_inserted)) {
+                lines.push(
+                    `PO detail row(s) inserted: ${item.po_detail_rows_inserted}`
+                );
+            }
+
+            const validation = item.po_validation;
+            if (validation && Array.isArray(validation.comparisons)) {
+                validation.comparisons.forEach(comparison => {
+                    const rate = comparison.field_results?.confirm_rate || {};
+                    const method = rate.comparison_method
+                        ? `, rate: ${rate.comparison_method}`
+                        : '';
+                    const mismatches = Array.isArray(comparison.mismatched_fields)
+                        && comparison.mismatched_fields.length
+                        ? `, review: ${comparison.mismatched_fields.join(', ')}`
+                        : '';
+                    lines.push(
+                        `EST ${comparison.estimation_number}: ${comparison.status}${method}${mismatches}`
+                    );
+                });
+            }
+
+            if (item.error) lines.push(item.error);
+            if (item.validation_only) {
+                lines.push('Database write: disabled (read-only mode)');
+            }
+            if (item.message) lines.push(item.message);
+            if (!lines.length && fallbackMessage) lines.push(fallbackMessage);
+            return lines;
+        };
+
+        const displayFileList = (files) => {
+            validFiles = [...files].filter(file => file.name.toLowerCase().endsWith('.pdf'));
+            fileRows.clear();
+            progressContainer.style.display = "none";
+            progressBar.style.width = "0%";
+
+            if (validFiles.length > 0) {
+                fileCountDisplay.textContent = `${validFiles.length} PDF file${validFiles.length !== 1 ? "s" : ""} ready.`;
+                fileList.replaceChildren();
+                validFiles.forEach((file, index) => {
+                    const row = createFileRow(file, index);
+                    fileRows.set(index, row);
+                    fileList.appendChild(row);
+                });
+                uploadBtn.style.display = "inline-block";
+            } else {
+                fileCountDisplay.textContent = "No valid PDF files found.";
+                fileList.innerHTML = INFO_NO_FILE;
+                uploadBtn.style.display = "none";
+            }
+        };
+
+        // --- Event Listeners for Drag and Drop ---
+        dropArea.addEventListener("dragover", (e) => { e.preventDefault(); dropArea.classList.add("dragover"); });
+        dropArea.addEventListener("dragleave", () => dropArea.classList.remove("dragover"));
+        dropArea.addEventListener("drop", (e) => {
+            e.preventDefault();
+            dropArea.classList.remove("dragover");
+            displayFileList(e.dataTransfer.files);
+        });
+
+        folderInput.addEventListener("change", (e) => displayFileList(e.target.files));
+
+        // --- Processing Logic ---
+
+        const parseResponse = async (response) => {
+            try {
+                return await response.json();
+            } catch (_error) {
+                return {};
+            }
+        };
+
+        const processFile = async (file, index) => {
+            const row = fileRows.get(index);
+            setOutcome(row, 'Processing', 'processing');
+            updateStage(row, 'uploaded', {
+                status: 'processing',
+                message: 'Sending PDF to server'
+            });
+
+            const formData = new FormData();
+            formData.append('files[]', file);
+
+            let response;
+            let data;
+            try {
+                response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                data = await parseResponse(response);
+            } catch (error) {
+                updateStage(row, 'uploaded', {
+                    status: 'failed',
+                    message: 'Could not reach the server'
+                });
+                setOutcome(row, 'Failed', 'failed');
+                showDetails(row, [error.message || 'Network error']);
+                return 'failed';
+            }
+
+            const inserted = Array.isArray(data.documents) ? data.documents[0] : null;
+            const skipped = Array.isArray(data.skipped) ? data.skipped[0] : null;
+            const failed = Array.isArray(data.errors) ? data.errors[0] : null;
+            const item = inserted || skipped || failed;
+
+            if (item?.workflow) {
+                applyWorkflow(row, item.workflow);
+            } else if (!response.ok) {
+                updateStage(row, 'uploaded', {
+                    status: 'failed',
+                    message: data.error || `HTTP ${response.status}`
+                });
+            }
+
+            if (inserted) {
+                if (inserted.validation_only) {
+                    setOutcome(row, 'Read Only', 'validated');
+                    showDetails(row, resultDetailLines(
+                        inserted,
+                        'Checked without database insertion'
+                    ));
+                    return 'validated';
+                }
+                setOutcome(row, 'Inserted', 'inserted');
+                showDetails(row, resultDetailLines(inserted, 'Inserted successfully'));
+                return 'inserted';
+            }
+
+            if (skipped) {
+                setOutcome(row, 'Skipped', 'skipped');
+                showDetails(row, resultDetailLines(skipped, 'Already inserted'));
+                return 'skipped';
+            }
+
+            const validationStatus = failed?.workflow?.validation?.status;
+            if (validationStatus === 'review_required') {
+                setOutcome(row, 'Review Required', 'review');
+                showDetails(row, resultDetailLines(failed, 'Validation requires review'));
+                return 'review';
+            }
+
+            setOutcome(row, 'Failed', 'failed');
+            showDetails(row, resultDetailLines(
+                failed,
+                data.error || data.message || `Server returned HTTP ${response.status}`
+            ));
+            return 'failed';
+        };
+
+        uploadBtn.addEventListener("click", async () => {
+            if (validFiles.length === 0) return;
+
+            progressContainer.style.display = "flex";
+            progressBar.style.width = "0%";
+            progressBar.classList.add('progress-bar-animated');
+            uploadBtn.disabled = true;
+            uploadBtn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> Processing...';
+
+            const totals = {
+                inserted: 0,
+                validated: 0,
+                skipped: 0,
+                review: 0,
+                failed: 0
+            };
+
+            for (let index = 0; index < validFiles.length; index += 1) {
+                const outcome = await processFile(validFiles[index], index);
+                totals[outcome] += 1;
+                const percentage = Math.round(((index + 1) / validFiles.length) * 100);
+                progressBar.style.width = `${percentage}%`;
+                fileCountDisplay.textContent = `Processed ${index + 1} of ${validFiles.length} PDF files.`;
+            }
+
+            progressBar.classList.remove('progress-bar-animated');
+            toastEl.classList.remove('bg-success', 'bg-warning', 'bg-danger');
+
+            if (totals.failed || totals.review) {
+                toastEl.classList.add('bg-warning');
+            } else {
+                toastEl.classList.add('bg-success');
+            }
+
+            toastBody.textContent =
+                `Inserted ${totals.inserted}, read-only ${totals.validated}, skipped ${totals.skipped}, `
+                + `review ${totals.review}, failed ${totals.failed}.`;
+            toastMsg.show();
+
+            uploadBtn.disabled = false;
+            uploadBtn.innerHTML = '<i class="bi bi-cloud-arrow-up"></i> Start Processing';
+        });
+    </script>
+
+</body>
+
+</html>

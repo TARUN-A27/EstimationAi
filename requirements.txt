@@ -1,0 +1,11 @@
+azure-cognitiveservices-vision-computervision
+azure-ai-contentunderstanding
+azure-core
+Flask
+msrest
+oracledb
+pdf2image
+pdfplumber
+Pillow
+python-dotenv
+Werkzeug

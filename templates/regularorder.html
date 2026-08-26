@@ -1,0 +1,639 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pending Documents</title>
+    <link rel="stylesheet"
+          href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <link rel="stylesheet"
+          href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;600;700&display=swap">
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #0a192f;
+            --bg-medium: #112240;
+            --card: #1c3a60;
+            --card-hover: #223a70;
+            --primary: #0066cc;
+            --accent: #64ffda;
+            --text: #e6f1ff;
+            --muted: #8892b0;
+            --error: #ff7b72;
+            --success-bg: rgba(100, 255, 218, 0.12);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            min-height: 100vh;
+            margin: 0;
+            padding: 30px 12px;
+            background: linear-gradient(135deg, var(--bg), var(--bg-medium));
+            color: var(--text);
+            font-family: "Fira Sans", system-ui, sans-serif;
+        }
+
+        main {
+            width: 98%;
+            margin: 0 auto;
+        }
+
+        .page-header {
+            display: grid;
+            grid-template-columns: 1fr auto 1fr;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 22px;
+        }
+
+        .back-link {
+            justify-self: start;
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .back-link:hover { text-decoration: underline; }
+
+        h1 {
+            margin: 0;
+            color: var(--accent);
+            text-align: center;
+            font-size: clamp(1.8rem, 4vw, 2.5rem);
+        }
+
+        .notice,
+        .error,
+        .controls,
+        .upload-message {
+            border-radius: 10px;
+            background: var(--card);
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.35);
+        }
+
+        .notice,
+        .error,
+        .upload-message {
+            margin: 16px 0;
+            padding: 14px 16px;
+        }
+
+        .notice { color: var(--muted); }
+        .error,
+        .upload-message.error { color: var(--error); }
+        .upload-message.success { color: var(--accent); }
+
+        .controls {
+            display: grid;
+            grid-template-columns:
+                minmax(210px, 1fr)
+                minmax(260px, 2fr)
+                minmax(100px, 0.45fr)
+                auto;
+            align-items: end;
+            gap: 14px;
+            margin: 20px 0;
+            padding: 18px;
+        }
+
+        .control {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+            font-weight: 600;
+        }
+
+        .control select,
+        .control input,
+        .search-button,
+        .page-button {
+            min-height: 42px;
+            border: 1px solid var(--muted);
+            border-radius: 7px;
+            background: var(--bg-medium);
+            color: var(--text);
+            padding: 9px 11px;
+            font: inherit;
+        }
+
+        .control select,
+        .control input { width: 100%; }
+
+        .control select:focus,
+        .control input:focus,
+        .search-button:focus-visible,
+        .page-button:focus-visible,
+        .upload-button:focus-visible {
+            border-color: var(--accent);
+            outline: 2px solid rgba(100, 255, 218, 0.25);
+            outline-offset: 1px;
+        }
+
+        .search-button,
+        .page-button,
+        .upload-button {
+            border-color: var(--accent);
+            background: var(--primary);
+            color: var(--text);
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        .search-button:hover,
+        .page-button:hover,
+        .upload-button:hover {
+            background: var(--accent);
+            color: var(--bg);
+        }
+
+        .summary-row,
+        .pagination {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin: 12px 0;
+            color: var(--muted);
+        }
+
+        .active-title {
+            margin: 0;
+            color: var(--accent);
+            font-size: 1.35rem;
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+            border-radius: 10px;
+            box-shadow: 0 6px 14px rgba(0, 0, 0, 0.35);
+        }
+
+        table {
+            width: 100%;
+            min-width: 1650px;
+            border-collapse: collapse;
+            background: var(--card);
+        }
+
+        th,
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid #233554;
+            text-align: left;
+            white-space: nowrap;
+        }
+
+        th {
+            position: sticky;
+            top: 0;
+            z-index: 1;
+            background: var(--primary);
+            color: var(--text);
+            text-transform: uppercase;
+            font-size: 0.88rem;
+            letter-spacing: 0.35px;
+        }
+
+        tbody tr:nth-child(even) { background: var(--bg-medium); }
+        tbody tr:hover { background: var(--card-hover); }
+        tbody tr.upload-complete {
+            background: var(--success-bg);
+            outline: 1px solid var(--accent);
+        }
+
+        .document-cell { min-width: 220px; }
+
+        .document-status {
+            display: inline-block;
+            margin-right: 10px;
+            color: var(--muted);
+            font-weight: 600;
+        }
+
+        .document-status.uploaded { color: var(--accent); }
+
+        .document-meta {
+            display: block;
+            margin-top: 5px;
+            color: var(--muted);
+            font-size: 0.82rem;
+        }
+
+        .manual-upload-form {
+            display: inline-block;
+            margin: 0;
+        }
+
+        .manual-file-input {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            clip-path: inset(50%);
+            white-space: nowrap;
+        }
+
+        .upload-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            min-height: 36px;
+            border: 1px solid var(--accent);
+            border-radius: 7px;
+            padding: 7px 11px;
+            font: inherit;
+            font-size: 0.9rem;
+        }
+
+        .manual-upload-form.is-uploading .upload-button {
+            border-color: var(--muted);
+            background: var(--bg-medium);
+            color: var(--muted);
+            cursor: wait;
+            pointer-events: none;
+        }
+
+        .empty-state {
+            margin: 18px 0;
+            padding: 28px;
+            border-radius: 10px;
+            background: var(--card);
+            color: var(--muted);
+            text-align: center;
+        }
+
+        .page-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .page-button {
+            display: inline-block;
+            min-width: 95px;
+            text-align: center;
+            text-decoration: none;
+        }
+
+        @media (max-width: 900px) {
+            .page-header { grid-template-columns: 1fr; }
+            .back-link,
+            h1 { justify-self: center; }
+            .controls { grid-template-columns: 1fr 1fr; }
+        }
+
+        @media (max-width: 600px) {
+            .controls { grid-template-columns: 1fr; }
+            .summary-row,
+            .pagination {
+                align-items: stretch;
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+<main>
+    <header class="page-header">
+        <a href="{{ url_for('dashboard') }}" class="back-link">
+            <i class="fas fa-arrow-circle-left"></i> Back to Dashboard
+        </a>
+        <h1><i class="fas fa-file-circle-exclamation"></i> Pending Documents</h1>
+        <span aria-hidden="true"></span>
+    </header>
+
+    <div class="notice">
+        Only the selected document type and the current page are loaded.
+        Upload a PDF where the document is N/A.
+    </div>
+
+    <form id="pending-controls" class="controls" method="get"
+          action="{{ url_for('regularorder') }}">
+        <label class="control">
+            Document type
+            <select id="document-type" name="type">
+                <option value="est" {% if document_type == 'est' %}selected{% endif %}>
+                    Estimation Sheet
+                </option>
+                <option value="mix" {% if document_type == 'mix' %}selected{% endif %}>
+                    Mixing Sheet
+                </option>
+                <option value="po" {% if document_type == 'po' %}selected{% endif %}>
+                    PO Document
+                </option>
+            </select>
+        </label>
+
+        <label class="control">
+            Filter
+            <input id="table-filter" name="filter" type="search"
+                   value="{{ filter_text }}"
+                   placeholder="EST, order, party, count or representative"
+                   autocomplete="off">
+        </label>
+
+        <label class="control">
+            Rows
+            <select id="page-size" name="rows">
+                {% for size in (10, 20, 50, 100) %}
+                <option value="{{ size }}" {% if page_size == size %}selected{% endif %}>
+                    {{ size }}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+
+        <button class="search-button" type="submit">
+            <i class="fas fa-search"></i> Apply
+        </button>
+    </form>
+
+    {% if error %}
+    <div class="error">
+        <i class="fas fa-triangle-exclamation"></i>
+        Database error: {{ error }}
+    </div>
+    {% endif %}
+
+    <div id="upload-message" class="upload-message" role="status"
+         aria-live="polite" hidden></div>
+
+    <div class="summary-row">
+        <h2 class="active-title">{{ document_label }} Pending</h2>
+        <span>
+            Page {{ page }} · {{ total_rows }} pending
+        </span>
+    </div>
+
+    {% if rows %}
+    <div class="table-wrap">
+        <table id="pending-table">
+            <thead>
+                <tr>
+                    <th>Document</th>
+                    {% if document_type in ('est', 'mix') %}
+                    <th>Est No</th>
+                    <th>Est Date</th>
+                    <th>Required Qty</th>
+                    <th>Booking Rate</th>
+                    <th>Auth Date</th>
+                    <th>Party</th>
+                    <th>Count</th>
+                    <th>Reference Type</th>
+                    <th>Reference No</th>
+                    <th>Representative</th>
+                    <th>Delay Days</th>
+                    <th>IA Cancel Remarks</th>
+                    {% else %}
+                    <th>Order No</th>
+                    <th>Entry Date</th>
+                    <th>Weight</th>
+                    <th>Order Date</th>
+                    <th>Rate</th>
+                    <th>Party</th>
+                    <th>Estimation No</th>
+                    <th>Party Order No</th>
+                    <th>Count</th>
+                    <th>Reference Order No</th>
+                    <th>Representative</th>
+                    <th>Delay Days</th>
+                    <th>IA Cancel Remarks</th>
+                    <th>ISO Cancel Remarks</th>
+                    {% endif %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td class="document-cell">
+                        <span class="document-status">N/A</span>
+                        <form class="manual-upload-form"
+                              action="{{ url_for(
+                                  'process_regularorder'
+                                  if document_type == 'po'
+                                  else 'process_enquiry'
+                              ) }}"
+                              method="post"
+                              enctype="multipart/form-data">
+                            <input type="hidden" name="expected_document_type"
+                                   value="{{ 'po' if document_type == 'po' else (
+                                       'mix' if document_type == 'mix' else 'estimation'
+                                   ) }}">
+                            <input type="hidden" name="expected_est_no"
+                                   value="{{ row.estimationno if document_type == 'po' else row.estno }}">
+                            {% if document_type == 'po' %}
+                            <input type="hidden" name="expected_order_no"
+                                   value="{{ row.rorderno }}">
+                            {% endif %}
+                            <input class="manual-file-input" type="file"
+                                   name="files[]" accept="application/pdf,.pdf"
+                                   id="pending-file-{{ loop.index }}" required>
+                            <label class="upload-button"
+                                   for="pending-file-{{ loop.index }}">
+                                <i class="fas fa-upload"></i> Upload PDF
+                            </label>
+                        </form>
+                    </td>
+
+                    {% if document_type in ('est', 'mix') %}
+                    <td>{{ row.estno if row.estno is not none else '-' }}</td>
+                    <td>{{ row.estdate if row.estdate is not none else '-' }}</td>
+                    <td>{{ row.req_qty if row.req_qty is not none else '-' }}</td>
+                    <td>{{ row.bookingrate if row.bookingrate is not none else '-' }}</td>
+                    <td>{{ row.authdate if row.authdate is not none else '-' }}</td>
+                    <td>{{ row.partyname if row.partyname is not none else '-' }}</td>
+                    <td>{{ row.countname if row.countname is not none else '-' }}</td>
+                    <td>{{ row.refrencetype if row.refrencetype is not none else '-' }}</td>
+                    <td>{{ row.refrenceno if row.refrenceno is not none else '-' }}</td>
+                    <td>{{ row.repname if row.repname is not none else '-' }}</td>
+                    <td>{{ row.delaydays if row.delaydays is not none else '-' }}</td>
+                    <td>{{ row.iacancelremarks if row.iacancelremarks is not none else '-' }}</td>
+                    {% else %}
+                    <td>{{ row.rorderno if row.rorderno is not none else '-' }}</td>
+                    <td>{{ row.entrydate if row.entrydate is not none else '-' }}</td>
+                    <td>{{ row.weight if row.weight is not none else '-' }}</td>
+                    <td>{{ row.orderdate if row.orderdate is not none else '-' }}</td>
+                    <td>{{ row.rate if row.rate is not none else '-' }}</td>
+                    <td>{{ row.partyname if row.partyname is not none else '-' }}</td>
+                    <td>{{ row.estimationno if row.estimationno is not none else '-' }}</td>
+                    <td>{{ row.partyorderno if row.partyorderno is not none else '-' }}</td>
+                    <td>{{ row.countname if row.countname is not none else '-' }}</td>
+                    <td>{{ row.reforderno if row.reforderno is not none else '-' }}</td>
+                    <td>{{ row.repname if row.repname is not none else '-' }}</td>
+                    <td>{{ row.delaydays if row.delaydays is not none else '-' }}</td>
+                    <td>{{ row.iacancelremarks if row.iacancelremarks is not none else '-' }}</td>
+                    <td>{{ row.isocancelremarks if row.isocancelremarks is not none else '-' }}</td>
+                    {% endif %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <i class="fas fa-circle-check"></i>
+        No pending {{ document_label }} rows were found{% if filter_text %} for this filter{% endif %}.
+    </div>
+    {% endif %}
+
+    <nav class="pagination" aria-label="Pending document pages">
+        <span>
+            Showing rows
+            {{ ((page - 1) * page_size) + 1 if rows else 0 }}
+            –
+            {{ ((page - 1) * page_size) + (rows|length) }}
+            of {{ total_rows }}
+        </span>
+        <div class="page-buttons">
+            {% if has_previous %}
+            <a class="page-button"
+               href="{{ url_for(
+                   'regularorder',
+                   type=document_type,
+                   filter=filter_text or None,
+                   rows=page_size,
+                   page=page - 1
+               ) }}">Previous</a>
+            {% endif %}
+            {% if has_next %}
+            <a class="page-button"
+               href="{{ url_for(
+                   'regularorder',
+                   type=document_type,
+                   filter=filter_text or None,
+                   rows=page_size,
+                   page=page + 1
+               ) }}">Next</a>
+            {% endif %}
+        </div>
+    </nav>
+</main>
+
+<script>
+    document.getElementById('document-type').addEventListener(
+        'change',
+        function () {
+            const form = document.getElementById('pending-controls');
+            form.elements.page?.remove();
+            form.submit();
+        }
+    );
+
+    document.getElementById('page-size').addEventListener(
+        'change',
+        function () {
+            document.getElementById('pending-controls').submit();
+        }
+    );
+
+    const uploadMessage = document.getElementById('upload-message');
+
+    function showUploadMessage(message, isError) {
+        uploadMessage.textContent = message;
+        uploadMessage.className =
+            `upload-message ${isError ? 'error' : 'success'}`;
+        uploadMessage.hidden = false;
+        uploadMessage.scrollIntoView({
+            behavior: 'smooth',
+            block: 'nearest'
+        });
+    }
+
+    document.querySelectorAll('.manual-upload-form').forEach((form) => {
+        const fileInput = form.querySelector('.manual-file-input');
+        const button = form.querySelector('.upload-button');
+        const row = form.closest('tr');
+        const cell = form.closest('.document-cell');
+        const status = cell.querySelector('.document-status');
+
+        fileInput.addEventListener('change', async function () {
+            if (!this.files.length) {
+                return;
+            }
+
+            const filename = this.files[0].name;
+            const estNo = form.elements.expected_est_no.value;
+            const documentType =
+                form.elements.expected_document_type.value;
+
+            form.classList.add('is-uploading');
+            button.innerHTML =
+                '<i class="fas fa-spinner fa-spin"></i> Uploading';
+            uploadMessage.hidden = true;
+
+            try {
+                const response = await fetch(form.action, {
+                    method: 'POST',
+                    body: new FormData(form),
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                });
+
+                let result;
+                try {
+                    result = await response.json();
+                } catch (_error) {
+                    result = {};
+                }
+
+                if (
+                    !response.ok
+                    || result.status === 'failed'
+                    || Number(result.inserted || 0) < 1
+                ) {
+                    const details = (
+                        Array.isArray(result.errors)
+                        && result.errors.length
+                    )
+                        ? result.errors
+                            .map((item) => item.error)
+                            .filter(Boolean)
+                            .join('; ')
+                        : result.error;
+                    throw new Error(
+                        details || `Upload failed (HTTP ${response.status})`
+                    );
+                }
+
+                const documentResult = (
+                    Array.isArray(result.documents)
+                    && result.documents.length
+                ) ? result.documents[0] : {};
+
+                status.textContent = `Uploaded: ${filename}`;
+                status.classList.add('uploaded');
+
+                const meta = document.createElement('span');
+                meta.className = 'document-meta';
+                const docIds = Array.isArray(documentResult.docids)
+                    ? documentResult.docids.join(', ')
+                    : documentResult.docid;
+                meta.textContent = docIds
+                    ? `Inserted successfully · DOCID ${docIds}`
+                    : 'Inserted successfully';
+
+                form.remove();
+                cell.appendChild(meta);
+                row.classList.add('upload-complete');
+
+                showUploadMessage(
+                    `${filename} was inserted successfully for `
+                    + `${documentType}, EST ${estNo}, and is now shown `
+                    + `in the table.`,
+                    false
+                );
+            } catch (error) {
+                showUploadMessage(error.message, true);
+                form.classList.remove('is-uploading');
+                button.innerHTML =
+                    '<i class="fas fa-upload"></i> Upload PDF';
+                fileInput.value = '';
+            }
+        });
+    });
+</script>
+</body>
+</html>
