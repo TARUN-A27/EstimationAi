@@ -73,66 +73,52 @@ class PartyCertificateV9Tests(unittest.TestCase):
         )
         self.assertEqual(match["stored_value"], "ORGANIC OCS NPOP")
 
-    def test_unknown_certificate_is_not_inserted(self) -> None:
+    def test_unknown_certificate_is_stored_as_extracted(self) -> None:
         rows = build_extracted_po_document_detail_rows(
             result_with(
                 party="ASM KNITWEARS PRIVATE LTD",
                 certification=["UNKNOWN CERT"],
             ),
             mappings(),
-            {"175164": "ASM KNITWEARS PRIVATE LTD"},
-            MASTER_NAMES,
         )
-        self.assertIsNone(rows[0]["certification"])
-        self.assertEqual(
-            rows[0]["certificate_match"]["matched_master_names"],
-            [],
-        )
+        self.assertEqual(rows[0]["certification"], "UNKNOWN CERT")
+        self.assertNotIn("certificate_match", rows[0])
 
-    def test_party_match_is_required_but_extracted_value_is_stored(self) -> None:
+    def test_extracted_party_is_stored_without_matching(self) -> None:
         rows = build_extracted_po_document_detail_rows(
             result_with(
                 party="ASM KNITWEARS PRIVATE LIMITED",
                 certification=["GRS"],
             ),
             mappings(),
-            {"175164": "ASM KNITWEARS PRIVATE LTD"},
-            MASTER_NAMES,
         )
         self.assertEqual(
             rows[0]["party_name"],
             "ASM KNITWEARS PRIVATE LIMITED",
         )
-        self.assertTrue(rows[0]["party_match"]["match"])
+        self.assertNotIn("party_match", rows[0])
         self.assertEqual(rows[0]["certification"], "GRS")
 
-    def test_existing_partial_ocr_party_rule_still_passes(self) -> None:
+    def test_partial_party_text_is_stored_exactly_as_extracted(self) -> None:
         rows = build_extracted_po_document_detail_rows(
             result_with(
                 party="ITWEARS PRIVATE LIMITED",
                 certification=[],
             ),
             mappings(),
-            {"175164": "ASM KNITWEARS PRIVATE LTD"},
-            MASTER_NAMES,
         )
         self.assertEqual(rows[0]["party_name"], "ITWEARS PRIVATE LIMITED")
-        self.assertEqual(
-            rows[0]["party_match"]["comparison_method"],
-            "PARTIAL_OCR_PARTY_NAME",
-        )
+        self.assertNotIn("party_match", rows[0])
 
-    def test_unrelated_party_blocks_complete_pdf(self) -> None:
-        with self.assertRaisesRegex(ValueError, "does not match"):
-            build_extracted_po_document_detail_rows(
-                result_with(
-                    party="UNRELATED COMPANY",
-                    certification=["BCI"],
-                ),
-                mappings(),
-                {"175164": "ASM KNITWEARS PRIVATE LTD"},
-                MASTER_NAMES,
-            )
+    def test_unrelated_party_is_stored_as_extracted(self) -> None:
+        rows = build_extracted_po_document_detail_rows(
+            result_with(
+                party="UNRELATED COMPANY",
+                certification=["BCI"],
+            ),
+            mappings(),
+        )
+        self.assertEqual(rows[0]["party_name"], "UNRELATED COMPANY")
 
     def test_production_no_longer_uses_legacy_matching_helpers(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")

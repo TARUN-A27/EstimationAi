@@ -194,6 +194,12 @@ def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "serial_number": first_field_value(
                         value_object.get("SerialNumber")
                     ),
+                    "estimate_number": field_values(
+                        value_object.get("EstimateNumber")
+                        or value_object.get("EstimationNumber")
+                        or value_object.get("EstimateNo")
+                        or value_object.get("EstNo")
+                    ),
                     "count": field_values(value_object.get("Count")),
                     "required_quantity": field_values(
                         value_object.get("RequiredQuantity")
@@ -1099,8 +1105,6 @@ def build_po_document_detail_rows(
 def build_extracted_po_document_detail_rows(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
-    expected_party_by_estimation: Mapping[str, Any] | None = None,
-    certificate_master_names: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build PO detail rows directly from Content Understanding output.
 
@@ -1117,34 +1121,18 @@ def build_extracted_po_document_detail_rows(
         regular_order_number = str(
             raw_mapping.get("regular_order_number") or ""
         ).strip()
-        reference_values = raw_mapping.get(
-            "reference_order_numbers"
-        ) or []
-        if isinstance(reference_values, str):
-            reference_values = [reference_values]
-        reference_keys = {
-            normalize_reference_number(value)
-            for value in reference_values
-            if normalize_reference_number(value)
-        }
-        reference_keys.add(
-            normalize_reference_number(regular_order_number)
-        )
         if not estimation_number or not regular_order_number:
             raise ValueError("Incomplete EST-to-order mapping")
         mappings.append(
             {
                 "estimation_number": estimation_number,
                 "regular_order_number": regular_order_number,
-                "reference_keys": reference_keys,
             }
         )
 
-    raw_lines = parse_order_lines(result_data)
-    order_lines, filtered_values = sanitize_order_lines(
-        raw_lines,
-        [int(mapping["estimation_number"]) for mapping in mappings],
-    )
+    # Production detail storage preserves the analyzer output. The legacy
+    # sanitization/comparison path remains available for diagnostics only.
+    order_lines = parse_order_lines(result_data)
     if not order_lines:
         raise ValueError("Content Understanding returned no OrderLines")
     if not mappings:
@@ -1192,90 +1180,53 @@ def build_extracted_po_document_detail_rows(
             )
         return format(distinct[0], "f")
 
-    expected_parties = {
-        str(key): str(value).strip()
-        for key, value in (expected_party_by_estimation or {}).items()
-        if str(value).strip()
+    mapping_by_estimation = {
+        mapping["estimation_number"]: mapping
+        for mapping in mappings
     }
-    certificate_masters = list(certificate_master_names or [])
 
-    assigned_estimations: set[str] = set()
+    def extracted_estimation_keys(values: Iterable[Any]) -> set[str]:
+        keys: set[str] = set()
+        for value in values:
+            # Content Understanding can return an integer, a numeric string,
+            # or labelled text such as "Est. No. 175164". Only numbers that
+            # resolve to a stamped EST mapping are accepted as linkage keys.
+            for token in re.findall(r"\d+", str(value).replace(",", "")):
+                try:
+                    key = str(int(token))
+                except ValueError:
+                    continue
+                if key in mapping_by_estimation:
+                    keys.add(key)
+        return keys
+
     rows: list[dict[str, Any]] = []
     for line_number, line in enumerate(order_lines, start=1):
         line_reference_values = line.get("reference_number") or []
-        line_reference_keys = {
-            normalize_reference_number(value)
-            for value in line_reference_values
-            if normalize_reference_number(value)
-        }
 
         if len(mappings) == 1:
             mapping = mappings[0]
         else:
-            candidates = [
-                item
-                for item in mappings
-                if line_reference_keys & item["reference_keys"]
-            ]
-            if len(candidates) != 1:
+            estimate_keys = extracted_estimation_keys(
+                line.get("estimate_number") or []
+            )
+            if len(estimate_keys) != 1:
                 raise ValueError(
                     "Cannot uniquely associate extracted order line "
                     f"{line_number} with a stamped estimation number "
-                    "using its extracted reference number"
+                    "using its extracted EstimateNumber"
                 )
-            mapping = candidates[0]
+            mapping = mapping_by_estimation[next(iter(estimate_keys))]
 
         estimation_number = mapping["estimation_number"]
-        if estimation_number in assigned_estimations:
-            raise ValueError(
-                "Multiple extracted order lines resolved to EST "
-                f"{estimation_number}; the detail table permits one row "
-                "per estimation and parent document"
-            )
-        assigned_estimations.add(estimation_number)
+        # Multiple extracted order lines can legitimately belong to the same
+        # EST. Each line is stored as its own detail row.
 
-        expected_party = expected_parties.get(estimation_number)
-        if expected_parties and not expected_party:
-            raise ValueError(
-                f"No expected Oracle party was loaded for EST "
-                f"{estimation_number}"
-            )
-        if expected_party:
-            party_match = compare_party_name(
-                expected_party,
-                party_names,
-            )
-            if (
-                not party_match["match"]
-                and party_match.get("partial_match_available")
-            ):
-                party_match.update(
-                    match=True,
-                    matched_value=party_match.get(
-                        "partial_matched_value"
-                    ),
-                    comparison_method="PARTIAL_OCR_PARTY_NAME",
-                )
-                party_match.pop("reason", None)
-            if not party_match["match"]:
-                raise ValueError(
-                    "Extracted PartyName does not match the Oracle party "
-                    f"for EST {estimation_number}"
-                )
-            party_name = str(
-                party_match.get("matched_value") or ""
-            ).strip()
-        else:
-            party_name = joined_values(
-                party_names,
-                field_name="PartyName",
-                maximum_length=300,
-            )
-            party_match = {
-                "match": None,
-                "comparison_method": "NOT_REQUESTED",
-                "matched_value": party_name,
-            }
+        party_name = joined_values(
+            party_names,
+            field_name="PartyName",
+            maximum_length=300,
+        )
 
         if len(party_name) > 300:
             raise ValueError(
@@ -1294,28 +1245,12 @@ def build_extracted_po_document_detail_rows(
             maximum_length=100,
         )
         raw_certification = line.get("certification") or []
-        if certificate_masters:
-            certificate_match = match_certificate_master_names(
-                raw_certification,
-                certificate_masters,
-            )
-            certification = certificate_match["stored_value"]
-        else:
-            certification = joined_values(
-                raw_certification,
-                field_name=f"Certification on line {line_number}",
-                maximum_length=300,
-                required=False,
-            )
-            certificate_match = {
-                "extracted": list(raw_certification),
-                "matched_master_names": (
-                    [certification] if certification else []
-                ),
-                "ambiguous": [],
-                "stored_value": certification,
-                "comparison_method": "NOT_REQUESTED",
-            }
+        certification = joined_values(
+            raw_certification,
+            field_name=f"Certification on line {line_number}",
+            maximum_length=300,
+            required=False,
+        )
 
         detail_row = {
             "estimation_number": int(estimation_number),
@@ -1335,21 +1270,6 @@ def build_extracted_po_document_detail_rows(
                 f"ConfirmRate on line {line_number}",
             ),
         }
-        if expected_parties:
-            detail_row["party_match"] = party_match
-        if certificate_masters:
-            detail_row["certificate_match"] = certificate_match
         rows.append(detail_row)
-
-    missing_estimations = [
-        mapping["estimation_number"]
-        for mapping in mappings
-        if mapping["estimation_number"] not in assigned_estimations
-    ]
-    if missing_estimations:
-        raise ValueError(
-            "No extracted order line was associated with stamped EST "
-            + ", ".join(missing_estimations)
-        )
 
     return rows

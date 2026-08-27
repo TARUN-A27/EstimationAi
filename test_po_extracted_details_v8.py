@@ -35,6 +35,9 @@ def content_result(
                         "type": "integer",
                         "valueInteger": index,
                     },
+                    "EstimateNumber": array_field(
+                        line.get("estimate_number", [])
+                    ),
                     "Count": array_field(line.get("count", [])),
                     "RequiredQuantity": array_field(
                         line.get("required_quantity", [])
@@ -131,20 +134,22 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["party_name"], "PARTY ONE, PARTY TWO")
 
-    def test_multiple_estimations_match_by_extracted_reference(self) -> None:
+    def test_multiple_estimations_use_extracted_estimate_number(self) -> None:
         result = content_result(
             party_names=["PDF PARTY"],
             lines=[
                 {
+                    "estimate_number": ["174704"],
                     "count": ["44S"],
                     "required_quantity": ["700"],
-                    "reference_number": ["REF-B"],
+                    "reference_number": ["UNRELATED-B"],
                     "confirm_rate": ["557.14"],
                 },
                 {
+                    "estimate_number": ["Est. No. 174702"],
                     "count": ["30S"],
                     "required_quantity": ["126"],
-                    "reference_number": ["REF-A"],
+                    "reference_number": ["UNRELATED-A"],
                     "confirm_rate": ["619.05"],
                 },
             ],
@@ -181,7 +186,10 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
                 }
             ],
         )
-        with self.assertRaisesRegex(ValueError, "Cannot uniquely associate"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "using its extracted EstimateNumber",
+        ):
             build_extracted_po_document_detail_rows(
                 result,
                 [
