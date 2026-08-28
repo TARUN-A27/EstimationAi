@@ -49,7 +49,7 @@ class PoDetailV6Tests(unittest.TestCase):
         self.assertIn(":reference_number", source)
         self.assertIn(":required_quantity", source)
         self.assertIn(
-            'detail["reference_number"][:100]',
+            'reference_number=detail["reference_number"]',
             source,
         )
         self.assertIn('detail["required_quantity"]', source)

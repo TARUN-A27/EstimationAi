@@ -572,6 +572,15 @@
                 );
             }
 
+            const rejectedLines = Array.isArray(item.po_detail_rejected_lines)
+                ? item.po_detail_rejected_lines
+                : [];
+            rejectedLines.forEach(rejected => {
+                lines.push(
+                    `PO line ${rejected.source_line_number} requires review: ${rejected.reason}`
+                );
+            });
+
             const validation = item.po_validation;
             if (validation && Array.isArray(validation.comparisons)) {
                 validation.comparisons.forEach(comparison => {
@@ -693,6 +702,22 @@
                     ));
                     return 'validated';
                 }
+                if (inserted.po_detail_status === 'REVIEW_REQUIRED') {
+                    setOutcome(row, 'Review Required', 'review');
+                    showDetails(row, resultDetailLines(
+                        inserted,
+                        'Parent stored; PO details require review'
+                    ));
+                    return 'review';
+                }
+                if (inserted.po_detail_status === 'PARTIAL') {
+                    setOutcome(row, 'Partially Inserted', 'review');
+                    showDetails(row, resultDetailLines(
+                        inserted,
+                        'Parent and available PO lines stored'
+                    ));
+                    return 'partial';
+                }
                 setOutcome(row, 'Inserted', 'inserted');
                 showDetails(row, resultDetailLines(inserted, 'Inserted successfully'));
                 return 'inserted';
@@ -731,6 +756,7 @@
             const totals = {
                 inserted: 0,
                 validated: 0,
+                partial: 0,
                 skipped: 0,
                 review: 0,
                 failed: 0
@@ -747,14 +773,14 @@
             progressBar.classList.remove('progress-bar-animated');
             toastEl.classList.remove('bg-success', 'bg-warning', 'bg-danger');
 
-            if (totals.failed || totals.review) {
+            if (totals.failed || totals.review || totals.partial) {
                 toastEl.classList.add('bg-warning');
             } else {
                 toastEl.classList.add('bg-success');
             }
 
             toastBody.textContent =
-                `Inserted ${totals.inserted}, read-only ${totals.validated}, skipped ${totals.skipped}, `
+                `Inserted ${totals.inserted}, partial ${totals.partial}, read-only ${totals.validated}, skipped ${totals.skipped}, `
                 + `review ${totals.review}, failed ${totals.failed}.`;
             toastMsg.show();
 

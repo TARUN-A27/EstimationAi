@@ -89,11 +89,11 @@ class PoParentIndependentV10Tests(unittest.TestCase):
 
     def test_detail_preparation_cannot_block_parent(self) -> None:
         self.assertIn(
-            "build_extracted_po_document_detail_rows",
+            "build_extracted_po_document_detail_result",
             self.insert_source,
         )
         self.assertIn(
-            "must not prevent parent persistence",
+            "must not prevent parent",
             self.insert_source,
         )
         self.assertIn(

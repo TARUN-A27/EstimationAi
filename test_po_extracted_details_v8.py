@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from po_content_validation import (
+    build_extracted_po_document_detail_result,
     build_extracted_po_document_detail_rows,
 )
 
@@ -174,7 +175,7 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
             [174704, 174702],
         )
 
-    def test_ambiguous_multi_estimation_document_is_blocked(self) -> None:
+    def test_ambiguous_multi_estimation_line_is_rejected_independently(self) -> None:
         result = content_result(
             party_names=["PDF PARTY"],
             lines=[
@@ -186,25 +187,27 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
                 }
             ],
         )
-        with self.assertRaisesRegex(
-            ValueError,
-            "using its extracted EstimateNumber",
-        ):
-            build_extracted_po_document_detail_rows(
-                result,
-                [
-                    {
-                        "estimation_no": 1,
-                        "regular_order_number": "LM1",
-                        "reference_order_numbers": ["REF1"],
-                    },
-                    {
-                        "estimation_no": 2,
-                        "regular_order_number": "LM2",
-                        "reference_order_numbers": ["REF2"],
-                    },
-                ],
-            )
+        detail_result = build_extracted_po_document_detail_result(
+            result,
+            [
+                {
+                    "estimation_no": 1,
+                    "regular_order_number": "LM1",
+                    "reference_order_numbers": ["REF1"],
+                },
+                {
+                    "estimation_no": 2,
+                    "regular_order_number": "LM2",
+                    "reference_order_numbers": ["REF2"],
+                },
+            ],
+        )
+        self.assertEqual(detail_result["rows"], [])
+        self.assertEqual(len(detail_result["rejected_lines"]), 1)
+        self.assertIn(
+            "extracted EstimateNumber",
+            detail_result["rejected_lines"][0]["reason"],
+        )
 
     def test_production_insert_omits_removed_columns_and_comparison(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
@@ -214,7 +217,7 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
         self.assertNotIn("FILENAME", detail_insert)
         self.assertNotIn("DOCUMENTTYPE", detail_insert)
         self.assertNotIn("validate_content_result", source)
-        self.assertIn("build_extracted_po_document_detail_rows", source)
+        self.assertIn("build_extracted_po_document_detail_result", source)
         self.assertIn('"oracle_value_comparison": "SKIPPED"', source)
 
     def test_v8_migration_drops_only_obsolete_columns(self) -> None:

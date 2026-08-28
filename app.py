@@ -28,8 +28,9 @@ from pending_reports import (
 )
 from po_content_validation import (
     analyze_po_document,
-    build_extracted_po_document_detail_rows,
+    build_extracted_po_document_detail_result,
 )
+from workflow_audit import WorkflowAuditStore
 from werkzeug.utils import secure_filename
 
 
@@ -47,6 +48,11 @@ app = Flask(__name__)
 app.config.update(
     UPLOAD_FOLDER=str(UPLOAD_DIR),
     MAX_CONTENT_LENGTH=int(os.getenv("MAX_UPLOAD_BYTES", 100 * 1024 * 1024)),
+)
+
+WORKFLOW_AUDIT = WorkflowAuditStore(
+    LOG_DIR / "upload_workflow.jsonl",
+    live_log_path=LOG_DIR / "upload_workflow_live.log",
 )
 
 
@@ -67,15 +73,81 @@ WORKFLOW_STAGE_LABELS = {
 }
 
 
-def new_upload_workflow() -> dict:
-    return {
-        name: {
-            "label": label,
-            "status": "pending",
-            "message": "Waiting",
-        }
-        for name, label in WORKFLOW_STAGE_LABELS.items()
-    }
+class UploadWorkflow(dict):
+    def __init__(self, workflow_id: str, filename: str) -> None:
+        super().__init__({
+            name: {
+                "label": label,
+                "status": "pending",
+                "message": "Waiting",
+            }
+            for name, label in WORKFLOW_STAGE_LABELS.items()
+        })
+        self.workflow_id = workflow_id
+        self.filename = filename
+        self.started_monotonic = time.monotonic()
+
+
+def new_upload_workflow(
+    filename: str,
+    workflow_id: str | None = None,
+) -> UploadWorkflow:
+    workflow = UploadWorkflow(
+        workflow_id or str(uuid.uuid4()),
+        filename,
+    )
+    event = WORKFLOW_AUDIT.start(workflow.workflow_id, filename)
+    app.logger.info(
+        "WORKFLOW id=%s file=%s stage=%s status=%s message=%s",
+        workflow.workflow_id,
+        filename,
+        event["stage"],
+        event["status"],
+        event["message"],
+    )
+    return workflow
+
+
+def record_workflow_event(
+    workflow: dict | None,
+    stage: str,
+    status: str,
+    message: str,
+    details=None,
+) -> None:
+    if not isinstance(workflow, UploadWorkflow):
+        return
+    event = WORKFLOW_AUDIT.record(
+        workflow.workflow_id,
+        filename=workflow.filename,
+        stage=stage,
+        label=WORKFLOW_STAGE_LABELS.get(stage, stage.replace("_", " ").title()),
+        status=status,
+        message=message,
+        details=details,
+    )
+    app.logger.info(
+        "WORKFLOW id=%s file=%s stage=%s status=%s message=%s",
+        workflow.workflow_id,
+        workflow.filename,
+        event["stage"],
+        event["status"],
+        event["message"],
+    )
+
+
+def public_workflow_id(workflow: dict | None) -> str | None:
+    if isinstance(workflow, UploadWorkflow):
+        return workflow.workflow_id
+    return None
+
+
+def workflow_duration_ms(workflow: dict | None) -> int | None:
+    if isinstance(workflow, UploadWorkflow):
+        return round(
+            (time.monotonic() - workflow.started_monotonic) * 1000
+        )
+    return None
 
 
 def set_workflow_stage(
@@ -92,6 +164,13 @@ def set_workflow_stage(
     item.update({"status": status, "message": message})
     if details is not None:
         item["details"] = details
+    record_workflow_event(
+        workflow,
+        stage,
+        status,
+        message,
+        details,
+    )
 
 
 def fail_active_workflow_stage(workflow: dict, message: str) -> None:
@@ -727,6 +806,7 @@ def prepare_stamp_image(image):
 
 def extract_po_stamp_estimation_numbers(
     file_path: Path,
+    workflow: dict | None = None,
 ) -> list[int]:
     """
     Extract every six-digit value beneath the stamped EST NO header.
@@ -735,6 +815,13 @@ def extract_po_stamp_estimation_numbers(
     The returned list is ordered according to the stamp rows.
     """
     file_path = Path(file_path)
+    started = time.monotonic()
+    record_workflow_event(
+        workflow,
+        "stamp_render",
+        "processing",
+        "Rendering document for stamped EST extraction",
+    )
 
     if not file_path.is_file():
         raise DocumentValidationError(
@@ -770,10 +857,29 @@ def extract_po_stamp_estimation_numbers(
             f"Unsupported stamp document type: {suffix}"
         )
 
+    record_workflow_event(
+        workflow,
+        "stamp_render",
+        "completed",
+        f"Prepared {len(images)} image page(s) for stamp extraction",
+        {
+            "page_count": len(images),
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        },
+    )
+
     estimation_numbers = []
     stamp_detected = False
 
-    for image in images:
+    for page_number, image in enumerate(images, start=1):
+        page_started = time.monotonic()
+        record_workflow_event(
+            workflow,
+            "stamp_ocr_page",
+            "processing",
+            f"Reading stamped EST area on page {page_number}",
+            {"page_number": page_number, "page_count": len(images)},
+        )
         prepared_image = prepare_stamp_image(image)
         lines = azure_read_lines_from_image(prepared_image)
 
@@ -785,27 +891,73 @@ def extract_po_stamp_estimation_numbers(
             estimation_numbers.extend(
                 extract_po_stamp_numbers_from_lines(lines)
             )
+        record_workflow_event(
+            workflow,
+            "stamp_ocr_page",
+            "completed",
+            f"Finished stamped EST scan on page {page_number}",
+            {
+                "page_number": page_number,
+                "page_count": len(images),
+                "stamp_header_found": any(
+                    is_est_stamp_header(line["text"])
+                    for line in lines
+                ),
+                "duration_ms": round(
+                    (time.monotonic() - page_started) * 1000
+                ),
+            },
+        )
 
     estimation_numbers = unique(estimation_numbers)
 
     if not stamp_detected:
+        record_workflow_event(
+            workflow,
+            "stamp_extraction",
+            "failed",
+            "Stamped EST header was not detected",
+        )
         raise DocumentValidationError(
             f"Azure OCR could not locate the stamped EST NO "
             f"header in {file_path.name}"
         )
 
     if not estimation_numbers:
+        record_workflow_event(
+            workflow,
+            "stamp_extraction",
+            "failed",
+            "Stamped EST header was found but no EST value was extracted",
+        )
         raise DocumentValidationError(
             f"The EST NO stamp was found in {file_path.name}, "
             f"but no clear six-digit estimation number was detected"
         )
 
+    record_workflow_event(
+        workflow,
+        "stamp_extraction",
+        "completed",
+        f"Extracted {len(estimation_numbers)} stamped EST value(s)",
+        {"estimation_count": len(estimation_numbers)},
+    )
     return estimation_numbers
 
 
-def extract_pdf_text(pdf_path: Path) -> str:
+def extract_pdf_text(
+    pdf_path: Path,
+    workflow: dict | None = None,
+) -> str:
     """Render and OCR every physical PDF page."""
     poppler_path = os.getenv("POPPLER_PATH", "").strip() or None
+    render_started = time.monotonic()
+    record_workflow_event(
+        workflow,
+        "pdf_render",
+        "processing",
+        "Rendering PDF pages for OCR",
+    )
 
     try:
         images = convert_from_path(
@@ -814,44 +966,111 @@ def extract_pdf_text(pdf_path: Path) -> str:
             poppler_path=poppler_path,
         )
     except Exception as error:
+        record_workflow_event(
+            workflow,
+            "pdf_render",
+            "failed",
+            f"PDF rendering failed: {error}",
+        )
         raise DocumentValidationError(
             f"Could not render PDF: {error}"
         ) from error
 
     page_count = len(images)
-
     if page_count == 0:
+        record_workflow_event(
+            workflow,
+            "pdf_render",
+            "failed",
+            "PDF contains no renderable pages",
+        )
         raise DocumentValidationError(
             "PDF contains no renderable pages"
         )
 
     if page_count > MAX_PDF_PAGES:
+        record_workflow_event(
+            workflow,
+            "pdf_render",
+            "failed",
+            f"PDF page count {page_count} exceeds the limit",
+            {"page_count": page_count, "maximum_pages": MAX_PDF_PAGES},
+        )
         raise DocumentValidationError(
             f"PDF has {page_count} pages; maximum is {MAX_PDF_PAGES}"
         )
 
+    record_workflow_event(
+        workflow,
+        "pdf_render",
+        "completed",
+        f"Rendered {page_count} PDF page(s)",
+        {
+            "page_count": page_count,
+            "duration_ms": round(
+                (time.monotonic() - render_started) * 1000
+            ),
+        },
+    )
+
     extracted_pages = []
 
     for page_number, image in enumerate(images, start=1):
+        page_started = time.monotonic()
+        record_workflow_event(
+            workflow,
+            "ocr_page",
+            "processing",
+            f"OCR processing page {page_number} of {page_count}",
+            {"page_number": page_number, "page_count": page_count},
+        )
         try:
             page_text = (
                 azure_ocr_from_image(image) or ""
             ).strip()
         except Exception as error:
+            record_workflow_event(
+                workflow,
+                "ocr_page",
+                "failed",
+                f"OCR failed on page {page_number}: {error}",
+                {"page_number": page_number, "page_count": page_count},
+            )
             raise DocumentValidationError(
                 f"Azure OCR failed on PDF page {page_number}: {error}"
             ) from error
+
+        # Do not silently insert a document if any page was missed.
+        if not page_text:
+            record_workflow_event(
+                workflow,
+                "ocr_page",
+                "failed",
+                f"OCR returned no text for page {page_number}",
+                {"page_number": page_number, "page_count": page_count},
+            )
+            raise DocumentValidationError(
+                f"No text could be extracted from PDF page {page_number}"
+            )
 
         print(
             f"OCR page {page_number}/{page_count}: "
             f"{len(page_text)} characters"
         )
-
-        # Do not silently insert a document if any page was missed.
-        if not page_text:
-            raise DocumentValidationError(
-                f"No text could be extracted from PDF page {page_number}"
-            )
+        record_workflow_event(
+            workflow,
+            "ocr_page",
+            "completed",
+            f"OCR completed page {page_number} of {page_count}",
+            {
+                "page_number": page_number,
+                "page_count": page_count,
+                "character_count": len(page_text),
+                "duration_ms": round(
+                    (time.monotonic() - page_started) * 1000
+                ),
+            },
+        )
 
         extracted_pages.append(page_text)
 
@@ -863,7 +1082,7 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
 
 def filename_document_type(filename: str) -> str:
-    """Route uploads using the filename, never OCR text."""
+    """Classify explicit document markers in an upload filename."""
     name = re.sub(
         r"[^A-Z0-9]+",
         "_",
@@ -876,6 +1095,7 @@ def filename_document_type(filename: str) -> str:
         "PODOCUMENT" in name
         or "FILE_PO" in name
         or re.search(r"(?:^|_)PO(?:_|$)", name)
+        or re.search(r"(?:^|_)(?:LMO?|PO)\d{4,}", name)
     ):
         found.append("po")
 
@@ -950,6 +1170,7 @@ def expected_est_no_from_request() -> int | None:
 def extract_expected_po_estimation_number(
     file_path: Path,
     expected_est_no: int,
+    workflow: dict | None = None,
 ) -> int:
     """
     If Azure misses the EST NO header, accept only the exact EST
@@ -1000,6 +1221,14 @@ def extract_expected_po_estimation_number(
 
     # One page at a time avoids keeping the entire PDF in memory.
     for page_number in range(1, page_count + 1):
+        page_started = time.monotonic()
+        record_workflow_event(
+            workflow,
+            "targeted_est_ocr_page",
+            "processing",
+            f"Checking selected EST on page {page_number} of {page_count}",
+            {"page_number": page_number, "page_count": page_count},
+        )
         images = convert_from_path(
             str(file_path),
             dpi=300,
@@ -1029,10 +1258,30 @@ def extract_expected_po_estimation_number(
 
                     if len(digits) == 6:
                         detected.add(digits)
+        record_workflow_event(
+            workflow,
+            "targeted_est_ocr_page",
+            "completed",
+            f"Checked selected EST on page {page_number} of {page_count}",
+            {
+                "page_number": page_number,
+                "page_count": page_count,
+                "duration_ms": round(
+                    (time.monotonic() - page_started) * 1000
+                ),
+            },
+        )
 
     if expected_text not in detected:
         shown = ", ".join(sorted(detected)) or "none"
 
+        record_workflow_event(
+            workflow,
+            "targeted_est_verification",
+            "failed",
+            "Selected EST was not confirmed by targeted OCR",
+            {"detected_candidate_count": len(detected)},
+        )
         raise DocumentValidationError(
             f"Selected EST No. {expected_text} was not found "
             f"by Azure OCR in {file_path.name}. "
@@ -1040,6 +1289,12 @@ def extract_expected_po_estimation_number(
             "Nothing was inserted"
         )
 
+    record_workflow_event(
+        workflow,
+        "targeted_est_verification",
+        "completed",
+        "Selected EST was confirmed by targeted OCR",
+    )
     return expected_est_no
 
 
@@ -1062,8 +1317,18 @@ def classify_document(text: str) -> str:
     ):
         return "estimation"
 
+    # PO sheets may label the business order as PO NO, LM NO, or LMO NO.
+    # Punctuation has already been normalized to spaces, so these patterns
+    # also cover P.O. No, L.M. No, and similar printed/OCR variants.
     if re.search(
-        r"\bP\s*O\s+(?:NO|NUMBER)\b",
+        r"\b(?:P\s*O|L\s*M(?:\s*O)?)\s+(?:NO|NUMBER)\b",
+        normalized_text,
+    ):
+        return "po"
+
+    # Some scans preserve only the identifier and lose the NO/NUMBER label.
+    if re.search(
+        r"\b(?:P\s*O|L\s*M(?:\s*O)?)\s*\d{4,}",
         normalized_text,
     ):
         return "po"
@@ -1140,7 +1405,15 @@ def insert_enquiry_document(
     remarks: str,
     system_name: str,
     expected_est_no: int | None = None,
+    workflow: dict | None = None,
 ):
+
+    record_workflow_event(
+        workflow,
+        "enquiry_validation",
+        "processing",
+        "Validating estimation or mixing document insertion inputs",
+    )
 
     type_codes = {"estimation": 1, "mix": 2}
 
@@ -1162,6 +1435,7 @@ def insert_enquiry_document(
             verified_est_no = extract_expected_po_estimation_number(
                 file_path=file_path,
                 expected_est_no=expected_est_no,
+                workflow=workflow,
             )
 
             candidate_est_nos = unique([
@@ -1190,10 +1464,44 @@ def insert_enquiry_document(
     if not blob_data:
         raise DocumentValidationError("Uploaded PDF is empty")
 
-    connection = get_db_connection()
+    record_workflow_event(
+        workflow,
+        "enquiry_validation",
+        "completed",
+        "Insertion inputs validated",
+        {"candidate_estimation_count": len(candidate_est_nos)},
+    )
+    record_workflow_event(
+        workflow,
+        "oracle_connection",
+        "processing",
+        "Opening Oracle connection",
+    )
+    try:
+        connection = get_db_connection()
+    except Exception as exc:
+        record_workflow_event(
+            workflow,
+            "oracle_connection",
+            "failed",
+            f"Oracle connection failed: {exc}",
+        )
+        raise
+    record_workflow_event(
+        workflow,
+        "oracle_connection",
+        "completed",
+        "Oracle connection opened",
+    )
 
     try:
         with connection.cursor() as cursor:
+            record_workflow_event(
+                workflow,
+                "estimation_lookup",
+                "processing",
+                "Checking extracted EST values in COSTESTIMATION",
+            )
             est_nos = existing_estimation_numbers(
                 cursor,
                 candidate_est_nos,
@@ -1204,9 +1512,25 @@ def insert_enquiry_document(
                     f"No extracted estimation number from {filename} "
                     "exists in COSTESTIMATION"
                 )
+            record_workflow_event(
+                workflow,
+                "estimation_lookup",
+                "completed",
+                f"Resolved {len(est_nos)} valid EST value(s)",
+                {
+                    "candidate_count": len(candidate_est_nos),
+                    "valid_count": len(est_nos),
+                },
+            )
 
             # Dynamic duplicate check using every valid EST number
             # extracted from the uploaded PDF.
+            record_workflow_event(
+                workflow,
+                "duplicate_check",
+                "processing",
+                "Checking whether extracted EST values already exist",
+            )
             valid_est_set = set(est_nos)
             invalid_est_nos = [
                 value
@@ -1267,6 +1591,19 @@ def insert_enquiry_document(
                     "Nothing was inserted"
                 )
 
+            record_workflow_event(
+                workflow,
+                "duplicate_check",
+                "completed",
+                "Completed existing-document duplicate check",
+                {
+                    "new_estimation_count": len(missing_est_nos),
+                    "existing_estimation_count": len(
+                        already_inserted_est_nos
+                    ),
+                },
+            )
+
             # Store all missing EST numbers from this uploaded PDF as one
             # new document group. Oracle owns DOCID allocation so concurrent
             # Estimation/Mixing uploads cannot receive the same value.
@@ -1277,6 +1614,13 @@ def insert_enquiry_document(
                 """
             )
             document_docid = int(cursor.fetchone()[0])
+
+            record_workflow_event(
+                workflow,
+                "enquiry_parent_insert",
+                "processing",
+                "Inserting document parent row",
+            )
 
             cursor.execute(
                 """
@@ -1310,9 +1654,22 @@ def insert_enquiry_document(
                 system_name=system_name[:50],
                 document_type_code=document_type_code,
             )
+            record_workflow_event(
+                workflow,
+                "enquiry_parent_insert",
+                "completed",
+                "Document parent row inserted",
+                {"docid": document_docid},
+            )
 
             # Insert one detail row for every verified EST number.
             # All rows use the same DOCID generated for this PDF.
+            record_workflow_event(
+                workflow,
+                "enquiry_detail_insert",
+                "processing",
+                f"Inserting {len(missing_est_nos)} document detail row(s)",
+            )
             cursor.executemany(
                 """
                 INSERT INTO ENQUIRYDOCUMENTDETAILS (
@@ -1334,8 +1691,27 @@ def insert_enquiry_document(
                     for est_no in missing_est_nos
                 ],
             )
+            record_workflow_event(
+                workflow,
+                "enquiry_detail_insert",
+                "completed",
+                f"Inserted {len(missing_est_nos)} document detail row(s)",
+                {"inserted_row_count": len(missing_est_nos)},
+            )
 
+        record_workflow_event(
+            workflow,
+            "oracle_commit",
+            "processing",
+            "Committing estimation or mixing document transaction",
+        )
         connection.commit()
+        record_workflow_event(
+            workflow,
+            "oracle_commit",
+            "completed",
+            "Estimation or mixing document transaction committed",
+        )
 
         return {
             "docid": document_docid,
@@ -1349,12 +1725,30 @@ def insert_enquiry_document(
                 invalid_est_nos,
         }
 
-    except Exception:
+    except Exception as exc:
+        record_workflow_event(
+            workflow,
+            "oracle_rollback",
+            "processing",
+            f"Rolling back document transaction: {exc}",
+        )
         connection.rollback()
+        record_workflow_event(
+            workflow,
+            "oracle_rollback",
+            "completed",
+            "Document transaction rolled back",
+        )
         raise
 
     finally:
         connection.close()
+        record_workflow_event(
+            workflow,
+            "oracle_connection",
+            "closed",
+            "Oracle connection closed",
+        )
 
 
 def upload_entry_context() -> tuple[str, str]:
@@ -1440,6 +1834,13 @@ def insert_regular_order_document(
     # rows are extracted from the actual PDF/image, not generic OCR text.
     _ = text
 
+    record_workflow_event(
+        workflow,
+        "po_input_validation",
+        "processing",
+        "Validating PO document insertion inputs",
+    )
+
     if not file_path.is_file():
         raise DocumentValidationError(
             f"Uploaded file is missing: {filename}"
@@ -1461,15 +1862,27 @@ def insert_regular_order_document(
             "SCM_ENTRY_USER_CODE must be numeric"
         ) from exc
 
+    record_workflow_event(
+        workflow,
+        "po_input_validation",
+        "completed",
+        "PO document insertion inputs validated",
+        {"file_size_bytes": len(blob_data)},
+    )
+
     if expected_est_no is None:
         extracted_values = (
-            extract_po_stamp_estimation_numbers(file_path)
+            extract_po_stamp_estimation_numbers(
+                file_path,
+                workflow=workflow,
+            )
         )
     else:
         extracted_values = [
             extract_expected_po_estimation_number(
                 file_path,
                 expected_est_no,
+                workflow=workflow,
             )
         ]
 
@@ -1515,6 +1928,7 @@ def insert_regular_order_document(
 
     content_result = None
     po_detail_error = None
+    po_detail_rejections = []
 
     try:
         content_result = analyze_po_document(file_path)
@@ -1558,7 +1972,28 @@ def insert_regular_order_document(
                 },
             )
 
-    connection = get_db_connection()
+    record_workflow_event(
+        workflow,
+        "oracle_connection",
+        "processing",
+        "Opening Oracle connection for PO insertion",
+    )
+    try:
+        connection = get_db_connection()
+    except Exception as exc:
+        record_workflow_event(
+            workflow,
+            "oracle_connection",
+            "failed",
+            f"Oracle connection failed: {exc}",
+        )
+        raise
+    record_workflow_event(
+        workflow,
+        "oracle_connection",
+        "completed",
+        "Oracle connection opened for PO insertion",
+    )
 
     try:
         with connection.cursor() as cursor:
@@ -1573,6 +2008,13 @@ def insert_regular_order_document(
             estimation_order_mappings = []
             order_numbers = []
             seen_orders = set()
+            record_workflow_event(
+                workflow,
+                "oracle_est_order_mapping",
+                "processing",
+                f"Resolving {len(estimation_numbers)} EST value(s) to regular orders",
+                {"estimation_count": len(estimation_numbers)},
+            )
 
             # Resolve every stamped estimation to its regular-order parent.
             # This is identity/linkage resolution only; extracted PO values
@@ -1696,6 +2138,17 @@ def insert_regular_order_document(
                     seen_orders.add(order_no)
                     order_numbers.append(order_no)
 
+            record_workflow_event(
+                workflow,
+                "oracle_est_order_mapping",
+                "completed",
+                "Resolved stamped EST values to regular-order parents",
+                {
+                    "estimation_count": len(estimation_order_mappings),
+                    "regular_order_count": len(order_numbers),
+                },
+            )
+
             app.logger.warning(
                 "PO PRE-INSERT filename=%s estimations=%s "
                 "estimation_order_mappings=%s distinct_orders=%s "
@@ -1711,15 +2164,48 @@ def insert_regular_order_document(
             po_detail_rows = []
             if content_result is not None:
                 try:
-                    po_detail_rows = (
-                        build_extracted_po_document_detail_rows(
-                            content_result,
-                            estimation_order_mappings,
+                    record_workflow_event(
+                        workflow,
+                        "po_detail_preparation",
+                        "processing",
+                        "Preparing extracted PO lines for storage",
+                    )
+                    detail_result = build_extracted_po_document_detail_result(
+                        content_result,
+                        estimation_order_mappings,
+                    )
+                    po_detail_rows = detail_result["rows"]
+                    po_detail_rejections = detail_result[
+                        "rejected_lines"
+                    ]
+                    if po_detail_rejections:
+                        app.logger.warning(
+                            "PO DETAIL PARTIAL filename=%s "
+                            "prepared_rows=%s rejected_lines=%s",
+                            filename,
+                            len(po_detail_rows),
+                            po_detail_rejections,
                         )
+                    record_workflow_event(
+                        workflow,
+                        "po_detail_preparation",
+                        (
+                            "partial"
+                            if po_detail_rejections
+                            else "completed"
+                        ),
+                        "Prepared independently insertable PO detail lines",
+                        {
+                            "prepared_row_count": len(po_detail_rows),
+                            "rejected_line_count": len(
+                                po_detail_rejections
+                            ),
+                        },
                     )
                 except Exception as exc:
-                    # A missing/ambiguous extracted field or multi-line
-                    # association problem must not prevent parent persistence.
+                    # Analyzer/result-level failures must not prevent parent
+                    # persistence. Line-level failures are returned separately
+                    # and do not discard independently insertable rows.
                     po_detail_error = str(exc)
                     po_detail_rows = []
                     app.logger.warning(
@@ -1727,6 +2213,19 @@ def insert_regular_order_document(
                         filename,
                         po_detail_error,
                     )
+                    record_workflow_event(
+                        workflow,
+                        "po_detail_preparation",
+                        "failed",
+                        f"PO detail preparation failed: {exc}",
+                    )
+            else:
+                record_workflow_event(
+                    workflow,
+                    "po_detail_preparation",
+                    "skipped",
+                    "PO detail preparation skipped because extraction was unavailable",
+                )
 
             extraction_details = {
                 "analyzer_id": os.getenv(
@@ -1739,22 +2238,27 @@ def insert_regular_order_document(
                 "detail_status": (
                     "REVIEW_REQUIRED"
                     if po_detail_error
+                    else "PARTIAL"
+                    if po_detail_rejections
                     else "READY"
                 ),
                 "detail_error": po_detail_error,
+                "rejected_lines": po_detail_rejections,
                 "oracle_value_comparison": "SKIPPED",
                 "party_name_comparison": "SKIPPED",
                 "certificate_master_match": "SKIPPED",
             }
             app.logger.info(
                 "PO DETAILS PREPARED filename=%s analyzer=%s "
-                "estimations=%s detail_rows=%s "
+                "estimations=%s prepared_row_count=%s "
+                "rejected_line_count=%s "
                 "oracle_detail_value_comparison=SKIPPED "
                 "party_comparison=SKIPPED certificate_master=SKIPPED",
                 filename,
                 extraction_details["analyzer_id"],
                 estimation_numbers,
-                po_detail_rows,
+                len(po_detail_rows),
+                len(po_detail_rejections),
             )
 
             if workflow is not None:
@@ -1765,6 +2269,16 @@ def insert_regular_order_document(
                         "review_required",
                         "Parent PO can be stored; extracted details "
                         f"require review: {po_detail_error}",
+                        extraction_details,
+                    )
+                elif po_detail_rejections:
+                    set_workflow_stage(
+                        workflow,
+                        "validation",
+                        "review_required",
+                        f"Prepared {len(po_detail_rows)} extracted line(s); "
+                        f"{len(po_detail_rejections)} line(s) could not be "
+                        "associated or represented safely",
                         extraction_details,
                     )
                 else:
@@ -1811,14 +2325,23 @@ def insert_regular_order_document(
                     "po_detail_status": (
                         "REVIEW_REQUIRED"
                         if po_detail_error
+                        else "PARTIAL"
+                        if po_detail_rejections
                         else "READY"
                     ),
                     "po_detail_error": po_detail_error,
+                    "po_detail_rejected_lines": po_detail_rejections,
                     "file_size_bytes": len(blob_data),
                 }
 
             # Lock the counter before duplicate checks and allocation.
             # This serializes concurrent uploads from LAN users.
+            record_workflow_event(
+                workflow,
+                "po_parent_counter_lock",
+                "processing",
+                "Locking PO DOCID configuration row",
+            )
             cursor.execute(
                 """
                 SELECT MAXDOCID
@@ -1835,12 +2358,28 @@ def insert_regular_order_document(
                 )
 
             configured_max_docid = int(config_rows[0][0])
+            record_workflow_event(
+                workflow,
+                "po_parent_counter_lock",
+                "completed",
+                "PO DOCID configuration row locked",
+            )
 
             # Parent persistence uses only the established RORDERNO identity.
             # Detail-table state must not block or roll back the parent PDF.
             existing_parent_by_order = {}
 
-            for order_no in order_numbers:
+            for order_index, order_no in enumerate(order_numbers, start=1):
+                record_workflow_event(
+                    workflow,
+                    "po_parent_lookup",
+                    "processing",
+                    f"Checking existing PO parent {order_index} of {len(order_numbers)}",
+                    {
+                        "order_index": order_index,
+                        "order_count": len(order_numbers),
+                    },
+                )
                 order_no_key = order_no.strip().upper()
                 cursor.execute(
                     """
@@ -1866,6 +2405,17 @@ def insert_regular_order_document(
                         replacement["docid"],
                         replacement["filename"],
                     )
+                record_workflow_event(
+                    workflow,
+                    "po_parent_lookup",
+                    "completed",
+                    f"Checked PO parent {order_index} of {len(order_numbers)}",
+                    {
+                        "order_index": order_index,
+                        "order_count": len(order_numbers),
+                        "replacement": replacement is not None,
+                    },
+                )
 
             cursor.execute(
                 """
@@ -1891,9 +2441,15 @@ def insert_regular_order_document(
             processed_rows = []
             deleted_detail_row_count = 0
 
-            for order_no in order_numbers:
+            for order_index, order_no in enumerate(order_numbers, start=1):
                 existing_parent = existing_parent_by_order.get(order_no)
                 if existing_parent is not None:
+                    record_workflow_event(
+                        workflow,
+                        "po_parent_upsert",
+                        "processing",
+                        f"Replacing PO parent {order_index} of {len(order_numbers)}",
+                    )
                     cursor.execute(
                         """
                         UPDATE REGULARORDER_PODOCUMENT
@@ -1933,8 +2489,24 @@ def insert_regular_order_document(
                             "deleted_detail_rows": 0,
                         }
                     )
+                    record_workflow_event(
+                        workflow,
+                        "po_parent_upsert",
+                        "completed",
+                        f"Replaced PO parent {order_index} of {len(order_numbers)}",
+                        {
+                            "action": "replaced",
+                            "docid": existing_parent["docid"],
+                        },
+                    )
                     continue
 
+                record_workflow_event(
+                    workflow,
+                    "po_parent_sequence",
+                    "processing",
+                    f"Allocating parent ID for order {order_index} of {len(order_numbers)}",
+                )
                 cursor.execute(
                     """
                     SELECT REGULARORDER_PODOCUMENT_SEQ.NEXTVAL
@@ -1950,6 +2522,12 @@ def insert_regular_order_document(
                         f"current table maximum is {maximum_id}"
                     )
 
+                record_workflow_event(
+                    workflow,
+                    "po_parent_upsert",
+                    "processing",
+                    f"Inserting PO parent {order_index} of {len(order_numbers)}",
+                )
                 cursor.execute(
                     """
                     INSERT INTO REGULARORDER_PODOCUMENT (
@@ -1995,6 +2573,13 @@ def insert_regular_order_document(
                         "deleted_detail_rows": 0,
                     }
                 )
+                record_workflow_event(
+                    workflow,
+                    "po_parent_upsert",
+                    "completed",
+                    f"Inserted PO parent {order_index} of {len(order_numbers)}",
+                    {"action": "inserted", "docid": document_docid},
+                )
 
                 maximum_id = document_id
                 maximum_docid = document_docid
@@ -2004,6 +2589,12 @@ def insert_regular_order_document(
                 for row in processed_rows
             }
 
+            record_workflow_event(
+                workflow,
+                "po_parent_counter_update",
+                "processing",
+                "Updating PO DOCID configuration",
+            )
             cursor.execute(
                 """
                 UPDATE REGULARORDER_PODOCUMENT_CONFIG
@@ -2019,10 +2610,29 @@ def insert_regular_order_document(
                     "Failed to update the PO DOCID counter. "
                     "Nothing was inserted"
                 )
+            record_workflow_event(
+                workflow,
+                "po_parent_counter_update",
+                "completed",
+                "PO DOCID configuration updated",
+            )
 
         # Commit the established parent-table workflow independently. Party,
         # certificate and extracted line checks cannot undo this transaction.
+        record_workflow_event(
+            workflow,
+            "po_parent_commit",
+            "processing",
+            "Committing PO parent transaction",
+        )
         connection.commit()
+        record_workflow_event(
+            workflow,
+            "po_parent_commit",
+            "completed",
+            f"Committed {len(processed_rows)} PO parent row(s)",
+            {"parent_row_count": len(processed_rows)},
+        )
 
         inserted_detail_rows = []
 
@@ -2030,6 +2640,13 @@ def insert_regular_order_document(
         # details are retained when preparation or insertion requires review.
         if po_detail_rows:
             try:
+                record_workflow_event(
+                    workflow,
+                    "po_detail_transaction",
+                    "processing",
+                    f"Starting transaction for {len(po_detail_rows)} PO detail row(s)",
+                    {"detail_row_count": len(po_detail_rows)},
+                )
                 with connection.cursor() as cursor:
                     detail_rows_by_order = {}
                     for detail in po_detail_rows:
@@ -2038,7 +2655,16 @@ def insert_regular_order_document(
                             [],
                         ).append(detail)
 
-                    for order_no in detail_rows_by_order:
+                    for order_index, order_no in enumerate(
+                        detail_rows_by_order,
+                        start=1,
+                    ):
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_lock",
+                            "processing",
+                            f"Locking detail set {order_index} of {len(detail_rows_by_order)}",
+                        )
                         order_no_key = order_no.strip().upper()
                         parent_docid = docid_by_order.get(order_no)
                         if parent_docid is None:
@@ -2092,7 +2718,20 @@ def insert_regular_order_document(
                             if replacement
                             else []
                         )
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_lock",
+                            "completed",
+                            f"Locked detail set {order_index} of {len(detail_rows_by_order)}",
+                            {"existing_detail_count": expected_deleted},
+                        )
 
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_delete",
+                            "processing",
+                            f"Replacing existing detail set {order_index} of {len(detail_rows_by_order)}",
+                        )
                         cursor.execute(
                             """
                             DELETE FROM REGULARORDER_PODOCUMENTDETAILS
@@ -2110,8 +2749,18 @@ def insert_regular_order_document(
                                 f"{cursor.rowcount}"
                             )
                         deleted_detail_row_count += cursor.rowcount
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_delete",
+                            "completed",
+                            f"Removed {cursor.rowcount} previous detail row(s)",
+                            {"deleted_row_count": cursor.rowcount},
+                        )
 
-                    for detail in po_detail_rows:
+                    for detail_index, detail in enumerate(
+                        po_detail_rows,
+                        start=1,
+                    ):
                         parent_docid = docid_by_order.get(
                             detail["regular_order_number"]
                         )
@@ -2121,6 +2770,12 @@ def insert_regular_order_document(
                                 f"EST No. {detail['estimation_number']}"
                             )
 
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_sequence",
+                            "processing",
+                            f"Allocating detail ID {detail_index} of {len(po_detail_rows)}",
+                        )
                         cursor.execute(
                             """
                             SELECT REGORDER_PODOCDETAILS_SEQ.NEXTVAL
@@ -2129,6 +2784,12 @@ def insert_regular_order_document(
                         )
                         detail_id = int(cursor.fetchone()[0])
 
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_insert",
+                            "processing",
+                            f"Inserting PO detail row {detail_index} of {len(po_detail_rows)}",
+                        )
                         cursor.execute(
                             """
                             INSERT INTO REGULARORDER_PODOCUMENTDETAILS (
@@ -2160,20 +2821,14 @@ def insert_regular_order_document(
                             detail_id=detail_id,
                             parent_docid=parent_docid,
                             estimation_number=detail["estimation_number"],
-                            party_name=detail["party_name"][:300],
-                            regular_order_number=(
-                                detail["regular_order_number"][:50]
-                            ),
-                            reference_number=(
-                                detail["reference_number"][:100]
-                            ),
+                            party_name=detail["party_name"],
+                            regular_order_number=detail[
+                                "regular_order_number"
+                            ],
+                            reference_number=detail["reference_number"],
                             required_quantity=detail["required_quantity"],
-                            count_name=detail["count_name"][:100],
-                            certification=(
-                                detail["certification"][:300]
-                                if detail["certification"]
-                                else None
-                            ),
+                            count_name=detail["count_name"],
+                            certification=detail["certification"],
                             net_rate=detail["net_rate"],
                         )
 
@@ -2184,10 +2839,47 @@ def insert_regular_order_document(
                                 **detail,
                             }
                         )
+                        record_workflow_event(
+                            workflow,
+                            "po_detail_insert",
+                            "completed",
+                            f"Inserted PO detail row {detail_index} of {len(po_detail_rows)}",
+                            {
+                                "detail_index": detail_index,
+                                "detail_row_count": len(po_detail_rows),
+                                "detail_id": detail_id,
+                                "parent_docid": parent_docid,
+                            },
+                        )
 
+                record_workflow_event(
+                    workflow,
+                    "po_detail_commit",
+                    "processing",
+                    "Committing PO detail transaction",
+                )
                 connection.commit()
+                record_workflow_event(
+                    workflow,
+                    "po_detail_commit",
+                    "completed",
+                    f"Committed {len(inserted_detail_rows)} PO detail row(s)",
+                    {"inserted_row_count": len(inserted_detail_rows)},
+                )
             except Exception as exc:
+                record_workflow_event(
+                    workflow,
+                    "po_detail_rollback",
+                    "processing",
+                    f"Rolling back PO detail transaction: {exc}",
+                )
                 connection.rollback()
+                record_workflow_event(
+                    workflow,
+                    "po_detail_rollback",
+                    "completed",
+                    "PO detail transaction rolled back",
+                )
                 inserted_detail_rows = []
                 deleted_detail_row_count = 0
                 po_detail_error = str(exc)
@@ -2207,10 +2899,21 @@ def insert_regular_order_document(
                     "review for %s",
                     filename,
                 )
+        else:
+            record_workflow_event(
+                workflow,
+                "po_detail_transaction",
+                "skipped",
+                "No independently insertable PO detail rows were available",
+            )
 
         po_detail_status = (
             "REVIEW_REQUIRED"
             if po_detail_error
+            else "PARTIAL"
+            if po_detail_rejections and inserted_detail_rows
+            else "REVIEW_REQUIRED"
+            if po_detail_rejections
             else "INSERTED"
             if inserted_detail_rows
             else "READY"
@@ -2243,6 +2946,8 @@ def insert_regular_order_document(
                 + (
                     "; extracted details require review"
                     if po_detail_error
+                    else "; some extracted lines require review"
+                    if po_detail_rejections
                     else f"; detail rows inserted: "
                     f"{len(inserted_detail_rows)}"
                 ),
@@ -2259,6 +2964,9 @@ def insert_regular_order_document(
                     ),
                     "po_detail_rows_inserted": len(
                         inserted_detail_rows
+                    ),
+                    "po_detail_lines_rejected": len(
+                        po_detail_rejections
                     ),
                 },
             )
@@ -2290,9 +2998,13 @@ def insert_regular_order_document(
             "po_detail_rows_inserted": len(inserted_detail_rows),
             "po_detail_status": po_detail_status,
             "po_detail_error": po_detail_error,
+            "po_detail_rejected_lines": po_detail_rejections,
             "message": (
                 "PO parent stored; extracted details require review"
                 if po_detail_error
+                else "PO parent and available extracted details stored; "
+                "some lines require review"
+                if po_detail_rejections
                 else "PO parent and available extracted details stored"
             ),
             "file_size_bytes": len(blob_data),
@@ -2302,7 +3014,19 @@ def insert_regular_order_document(
         # Roll back only work that has not already been committed. Parent
         # persistence is committed before the separately guarded detail
         # transaction.
+        record_workflow_event(
+            workflow,
+            "po_uncommitted_rollback",
+            "processing",
+            f"Rolling back uncommitted PO work: {exc}",
+        )
         connection.rollback()
+        record_workflow_event(
+            workflow,
+            "po_uncommitted_rollback",
+            "completed",
+            "Uncommitted PO work rolled back",
+        )
         if workflow is not None:
             database_stage = workflow.get("database_insert") or {}
             if database_stage.get("status") == "processing":
@@ -2316,6 +3040,12 @@ def insert_regular_order_document(
         raise
     finally:
         connection.close()
+        record_workflow_event(
+            workflow,
+            "oracle_connection",
+            "closed",
+            "Oracle connection closed after PO processing",
+        )
 
 
 @app.route("/estimation")
@@ -2408,12 +3138,27 @@ def upload_files():
 
     try:
         for uploaded_file in uploaded_files:
-            workflow = new_upload_workflow()
             filename = secure_filename(
                 uploaded_file.filename or ""
             )
+            workflow = new_upload_workflow(
+                filename or "(empty filename)"
+            )
+            workflow_id = public_workflow_id(workflow)
+            record_workflow_event(
+                workflow,
+                "file_validation",
+                "processing",
+                "Validating uploaded filename and file type",
+            )
 
             if not filename or not allowed_file(filename):
+                record_workflow_event(
+                    workflow,
+                    "file_validation",
+                    "failed",
+                    "Uploaded file is not an allowed PDF",
+                )
                 set_workflow_stage(
                     workflow,
                     "uploaded",
@@ -2428,15 +3173,74 @@ def upload_files():
                     "filename": filename or "(empty)",
                     "error": "Only PDF files are allowed",
                     "workflow": workflow,
+                    "workflow_id": workflow_id,
                 })
+                record_workflow_event(
+                    workflow,
+                    "workflow_complete",
+                    "failed",
+                    "Upload workflow ended during file validation",
+                )
                 continue
+
+            record_workflow_event(
+                workflow,
+                "file_validation",
+                "completed",
+                "Uploaded filename and file type validated",
+            )
 
             temporary_path = (
                 UPLOAD_DIR
                 / f"{uuid.uuid4().hex}_{filename}"
             )
-            temporary_paths.append(temporary_path)
-            uploaded_file.save(temporary_path)
+            temporary_paths.append((temporary_path, workflow))
+            record_workflow_event(
+                workflow,
+                "temporary_file",
+                "processing",
+                "Saving temporary upload file",
+            )
+            try:
+                uploaded_file.save(temporary_path)
+            except Exception as exc:
+                record_workflow_event(
+                    workflow,
+                    "temporary_file",
+                    "failed",
+                    f"Temporary upload save failed: {exc}",
+                )
+                set_workflow_stage(
+                    workflow,
+                    "uploaded",
+                    "failed",
+                    "The uploaded PDF could not be saved temporarily",
+                )
+                block_pending_workflow_stages(
+                    workflow,
+                    "Blocked because temporary upload save failed",
+                )
+                errors.append({
+                    "filename": filename,
+                    "error": "The uploaded PDF could not be saved temporarily",
+                    "workflow": workflow,
+                    "workflow_id": workflow_id,
+                })
+                record_workflow_event(
+                    workflow,
+                    "workflow_complete",
+                    "failed",
+                    "Upload workflow ended because temporary save failed",
+                    {"duration_ms": workflow_duration_ms(workflow)},
+                )
+                continue
+            record_workflow_event(
+                workflow,
+                "temporary_file",
+                "completed",
+                "Temporary upload file saved",
+                {"file_size_bytes": temporary_path.stat().st_size},
+            )
             set_workflow_stage(
                 workflow,
                 "uploaded",
@@ -2452,14 +3256,46 @@ def upload_files():
                     "processing",
                     "Extracting text and identifying the document",
                 )
-                text = extract_pdf_text(temporary_path)
+                text = extract_pdf_text(
+                    temporary_path,
+                    workflow=workflow,
+                )
 
                 if not text:
                     raise DocumentValidationError(
                         "No text could be extracted"
                     )
 
+                record_workflow_event(
+                    workflow,
+                    "document_classification",
+                    "processing",
+                    "Classifying document from OCR content",
+                )
                 document_type = classify_document(text)
+
+                # OCR content is authoritative when it identifies a known
+                # type. For otherwise unknown scans, use explicit PO/LM,
+                # mixing, or estimation markers from the filename.
+                classification_source = "ocr"
+                if document_type == "unknown":
+                    document_type = filename_document_type(filename)
+                    classification_source = "filename"
+
+                record_workflow_event(
+                    workflow,
+                    "document_classification",
+                    (
+                        "failed"
+                        if document_type in {"unknown", "ambiguous"}
+                        else "completed"
+                    ),
+                    f"Document classified as {document_type}",
+                    {
+                        "document_type": document_type,
+                        "classification_source": classification_source,
+                    },
+                )
 
                 set_workflow_stage(
                     workflow,
@@ -2472,11 +3308,11 @@ def upload_files():
                     },
                 )
 
-                if document_type == "unknown":
+                if document_type in {"unknown", "ambiguous"}:
                     raise DocumentValidationError(
-                        "Document type could not be identified from "
-                        "the extracted PDF text. Expected MIXING, "
-                        "CUSTOMER NAME, or PO NO"
+                        "Document type could not be identified uniquely "
+                        "from the extracted PDF text and filename. Expected "
+                        "MIXING, CUSTOMER NAME, PO NO, LM NO, or LMO NO"
                     )
 
                 if (
@@ -2558,6 +3394,7 @@ def upload_files():
                             remarks=remarks,
                             system_name=system_name,
                             expected_est_no=expected_est_no,
+                            workflow=workflow,
                         )
                         set_workflow_stage(
                             workflow,
@@ -2573,18 +3410,48 @@ def upload_files():
                             },
                         )
 
-                app.logger.warning(
-                    "UPLOAD DEBUG inserted filename=%s inserted=%s",
+                app.logger.info(
+                    "UPLOAD RESULT filename=%s document_type=%s "
+                    "parent_rows=%s detail_rows=%s detail_status=%s",
                     filename,
-                    inserted,
+                    document_type,
+                    inserted.get("document_rows_processed", 1),
+                    inserted.get("po_detail_rows_inserted", 0),
+                    inserted.get("po_detail_status", "NOT_APPLICABLE"),
                 )
 
                 results.append({
                     "filename": filename,
                     "document_type": document_type,
                     "workflow": workflow,
+                    "workflow_id": workflow_id,
                     **inserted,
                 })
+                record_workflow_event(
+                    workflow,
+                    "workflow_complete",
+                    "completed",
+                    "Upload workflow completed",
+                    {
+                        "document_type": document_type,
+                        "validation_only": bool(
+                            inserted.get("validation_only")
+                        ),
+                        "parent_row_count": inserted.get(
+                            "document_rows_processed",
+                            1,
+                        ),
+                        "detail_row_count": inserted.get(
+                            "po_detail_rows_inserted",
+                            0,
+                        ),
+                        "detail_status": inserted.get(
+                            "po_detail_status",
+                            "NOT_APPLICABLE",
+                        ),
+                        "duration_ms": workflow_duration_ms(workflow),
+                    },
+                )
 
             except Exception as exc:
                 message = str(exc)
@@ -2614,7 +3481,15 @@ def upload_files():
                         "filename": filename,
                         "error": message,
                         "workflow": workflow,
+                        "workflow_id": workflow_id,
                     })
+                    record_workflow_event(
+                        workflow,
+                        "workflow_complete",
+                        "skipped",
+                        f"Upload workflow skipped: {message}",
+                        {"duration_ms": workflow_duration_ms(workflow)},
+                    )
                     app.logger.info(
                         "Skipped existing document %s: %s",
                         filename,
@@ -2634,13 +3509,53 @@ def upload_files():
                         "filename": filename,
                         "error": message,
                         "workflow": workflow,
+                        "workflow_id": workflow_id,
                     })
+                    record_workflow_event(
+                        workflow,
+                        "workflow_complete",
+                        "failed",
+                        f"Upload workflow failed: {message}",
+                        {"duration_ms": workflow_duration_ms(workflow)},
+                    )
     finally:
-        for temporary_path in temporary_paths:
+        for temporary_path, workflow in temporary_paths:
             try:
+                record_workflow_event(
+                    workflow,
+                    "temporary_file_cleanup",
+                    "processing",
+                    "Removing temporary upload file",
+                )
                 temporary_path.unlink(missing_ok=True)
+                record_workflow_event(
+                    workflow,
+                    "temporary_file_cleanup",
+                    "completed",
+                    "Temporary upload file removed",
+                )
+                record_workflow_event(
+                    workflow,
+                    "workflow_closed",
+                    "completed",
+                    "Upload workflow and temporary-file cleanup finished",
+                    {"duration_ms": workflow_duration_ms(workflow)},
+                )
             except OSError:
                 app.logger.warning("Could not remove temporary upload %s", temporary_path)
+                record_workflow_event(
+                    workflow,
+                    "temporary_file_cleanup",
+                    "failed",
+                    "Temporary upload file could not be removed",
+                )
+                record_workflow_event(
+                    workflow,
+                    "workflow_closed",
+                    "review_required",
+                    "Upload workflow finished but temporary-file cleanup failed",
+                    {"duration_ms": workflow_duration_ms(workflow)},
+                )
 
     inserted_est_links = sum(
         len(

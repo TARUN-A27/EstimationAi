@@ -1102,15 +1102,21 @@ def build_po_document_detail_rows(
     return rows
 
 
-def build_extracted_po_document_detail_rows(
+def build_extracted_po_document_detail_result(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Build PO detail rows directly from Content Understanding output.
+) -> dict[str, list[dict[str, Any]]]:
+    """Build independently insertable PO lines from analyzer output.
 
     Oracle is used only to resolve the stamped estimation number to its
     regular-order parent. No CostEstimation, YarnCount, PartyMaster, booking
     rate, quantity, count, certification, reference, or party value is used.
+
+    Missing extracted business fields are represented by ``None``. A line is
+    rejected only when its parent cannot be resolved in a multi-EST document,
+    a numeric field contains more than one distinct value, or extracted text
+    cannot fit the target column. Rejection of one line never discards another
+    independently valid line.
     """
 
     mappings: list[dict[str, Any]] = []
@@ -1139,15 +1145,12 @@ def build_extracted_po_document_detail_rows(
         raise ValueError("No stamped EST-to-order mappings were resolved")
 
     party_names = parse_party_names(result_data)
-    if not party_names:
-        raise ValueError("Content Understanding returned no PartyName")
 
     def joined_values(
         values: Iterable[Any],
         *,
         field_name: str,
         maximum_length: int,
-        required: bool = True,
     ) -> str | None:
         cleaned = ordered_unique(
             str(value).strip()
@@ -1155,10 +1158,6 @@ def build_extracted_po_document_detail_rows(
             if str(value).strip()
         )
         if not cleaned:
-            if required:
-                raise ValueError(
-                    f"Content Understanding returned no {field_name}"
-                )
             return None
         result = ", ".join(cleaned)
         if len(result) > maximum_length:
@@ -1168,15 +1167,20 @@ def build_extracted_po_document_detail_rows(
             )
         return result
 
-    def one_numeric_value(values: Iterable[Any], field_name: str) -> str:
+    def one_numeric_value(
+        values: Iterable[Any],
+        field_name: str,
+    ) -> str | None:
         parsed: list[Decimal] = []
         for value in values:
             parsed.extend(decimal_values(value))
         distinct = list(dict.fromkeys(parsed))
+        if not distinct:
+            return None
         if len(distinct) != 1:
             raise ValueError(
-                f"Each extracted order line requires exactly one "
-                f"{field_name}; found {len(distinct)} distinct value(s)"
+                f"Extracted {field_name} contains "
+                f"{len(distinct)} distinct numeric values"
             )
         return format(distinct[0], "f")
 
@@ -1200,76 +1204,78 @@ def build_extracted_po_document_detail_rows(
                     keys.add(key)
         return keys
 
+    party_name = joined_values(
+        party_names,
+        field_name="PartyName",
+        maximum_length=300,
+    )
+
     rows: list[dict[str, Any]] = []
+    rejected_lines: list[dict[str, Any]] = []
     for line_number, line in enumerate(order_lines, start=1):
-        line_reference_values = line.get("reference_number") or []
-
-        if len(mappings) == 1:
-            mapping = mappings[0]
-        else:
-            estimate_keys = extracted_estimation_keys(
-                line.get("estimate_number") or []
-            )
-            if len(estimate_keys) != 1:
-                raise ValueError(
-                    "Cannot uniquely associate extracted order line "
-                    f"{line_number} with a stamped estimation number "
-                    "using its extracted EstimateNumber"
+        try:
+            if len(mappings) == 1:
+                mapping = mappings[0]
+            else:
+                estimate_keys = extracted_estimation_keys(
+                    line.get("estimate_number") or []
                 )
-            mapping = mapping_by_estimation[next(iter(estimate_keys))]
+                if len(estimate_keys) != 1:
+                    raise ValueError(
+                        "Cannot uniquely associate this line with one "
+                        "stamped EST using its extracted EstimateNumber"
+                    )
+                mapping = mapping_by_estimation[next(iter(estimate_keys))]
 
-        estimation_number = mapping["estimation_number"]
-        # Multiple extracted order lines can legitimately belong to the same
-        # EST. Each line is stored as its own detail row.
-
-        party_name = joined_values(
-            party_names,
-            field_name="PartyName",
-            maximum_length=300,
-        )
-
-        if len(party_name) > 300:
-            raise ValueError(
-                "Extracted PartyName exceeds the 300-character "
-                "database limit"
+            detail_row = {
+                "estimation_number": int(mapping["estimation_number"]),
+                "regular_order_number": mapping[
+                    "regular_order_number"
+                ],
+                "party_name": party_name,
+                "reference_number": joined_values(
+                    line.get("reference_number") or [],
+                    field_name=f"ReferenceNumber on line {line_number}",
+                    maximum_length=100,
+                ),
+                "required_quantity": one_numeric_value(
+                    line.get("required_quantity") or [],
+                    f"RequiredQuantity on line {line_number}",
+                ),
+                "count_name": joined_values(
+                    line.get("count") or [],
+                    field_name=f"Count on line {line_number}",
+                    maximum_length=100,
+                ),
+                "certification": joined_values(
+                    line.get("certification") or [],
+                    field_name=f"Certification on line {line_number}",
+                    maximum_length=300,
+                ),
+                "net_rate": one_numeric_value(
+                    line.get("confirm_rate") or [],
+                    f"ConfirmRate on line {line_number}",
+                ),
+            }
+            rows.append(detail_row)
+        except ValueError as exc:
+            rejected_lines.append(
+                {
+                    "source_line_number": line_number,
+                    "reason": str(exc),
+                }
             )
 
-        reference_number = joined_values(
-            line_reference_values,
-            field_name=f"ReferenceNumber on line {line_number}",
-            maximum_length=100,
-        )
-        count_name = joined_values(
-            line.get("count") or [],
-            field_name=f"Count on line {line_number}",
-            maximum_length=100,
-        )
-        raw_certification = line.get("certification") or []
-        certification = joined_values(
-            raw_certification,
-            field_name=f"Certification on line {line_number}",
-            maximum_length=300,
-            required=False,
-        )
+    return {"rows": rows, "rejected_lines": rejected_lines}
 
-        detail_row = {
-            "estimation_number": int(estimation_number),
-            "regular_order_number": mapping[
-                "regular_order_number"
-            ],
-            "party_name": party_name,
-            "reference_number": reference_number,
-            "required_quantity": one_numeric_value(
-                line.get("required_quantity") or [],
-                f"RequiredQuantity on line {line_number}",
-            ),
-            "count_name": count_name,
-            "certification": certification,
-            "net_rate": one_numeric_value(
-                line.get("confirm_rate") or [],
-                f"ConfirmRate on line {line_number}",
-            ),
-        }
-        rows.append(detail_row)
 
-    return rows
+def build_extracted_po_document_detail_rows(
+    result_data: Mapping[str, Any],
+    estimation_order_mappings: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning only independently valid rows."""
+
+    return build_extracted_po_document_detail_result(
+        result_data,
+        estimation_order_mappings,
+    )["rows"]

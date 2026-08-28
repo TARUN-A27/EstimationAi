@@ -68,7 +68,7 @@ class PoDetailsNoMatchingV11Tests(unittest.TestCase):
             for node in ast.walk(insert_function)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "build_extracted_po_document_detail_rows"
+            and node.func.id == "build_extracted_po_document_detail_result"
         ]
 
         self.assertEqual(len(calls), 1)
