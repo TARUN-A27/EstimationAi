@@ -2150,7 +2150,8 @@ def insert_regular_order_document(
             po_detail_rows = []
             association_counts = {
                 "direct_line_mapping_count": 0,
-                "reference_mapping_count": 0,
+                "mapping_reference_mapping_count": 0,
+                "legacy_reference_mapping_count": 0,
                 "single_parent_fallback_count": 0,
             }
             if content_result is not None:

@@ -414,6 +414,16 @@ def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
                     "reference_number": field_values(
                         named_field(value_object, "ReferenceNumber")
                     ),
+                    "mapping_reference_number": field_values(
+                        named_field(
+                            value_object,
+                            "MappingReferenceNumber",
+                            "MappingReferenceNo",
+                            "LineMappingReference",
+                            "LineLMNumber",
+                            "LMNumber",
+                        )
+                    ),
                     "confirm_rate": field_values(
                         named_field(value_object, "NetRate", "ConfirmRate")
                     ),
@@ -1688,7 +1698,7 @@ def build_po_document_detail_rows(
 def build_extracted_po_document_detail_result(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     """Build independently insertable PO lines from analyzer output.
 
     Oracle is used only to resolve the stamped estimation number to its
@@ -1811,7 +1821,8 @@ def build_extracted_po_document_detail_result(
     rejected_lines: list[dict[str, Any]] = []
     association_counts = {
         "direct_line_mapping_count": 0,
-        "reference_mapping_count": 0,
+        "mapping_reference_mapping_count": 0,
+        "legacy_reference_mapping_count": 0,
         "single_parent_fallback_count": 0,
     }
     for line_number, line in enumerate(order_lines, start=1):
@@ -1832,7 +1843,20 @@ def build_extracted_po_document_detail_result(
                 association_counts["direct_line_mapping_count"] += 1
             else:
                 reference_estimation_keys: set[str] = set()
-                for reference in line.get("reference_number") or []:
+                mapping_reference_values = (
+                    line.get("mapping_reference_number") or []
+                )
+                if mapping_reference_values:
+                    association_values = mapping_reference_values
+                    association_field = "MappingReferenceNumber"
+                    association_count = (
+                        "mapping_reference_mapping_count"
+                    )
+                else:
+                    association_values = line.get("reference_number") or []
+                    association_field = "ReferenceNumber"
+                    association_count = "legacy_reference_mapping_count"
+                for reference in association_values:
                     reference_estimation_keys.update(
                         reference_to_estimations.get(
                             identifier_key(reference),
@@ -1843,14 +1867,14 @@ def build_extracted_po_document_detail_result(
                     mapping = mapping_by_estimation[
                         next(iter(reference_estimation_keys))
                     ]
-                    association_counts["reference_mapping_count"] += 1
+                    association_counts[association_count] += 1
                 elif len(reference_estimation_keys) > 1:
                     raise ValueError(
-                        "Extracted ReferenceNumber maps this line to "
+                        f"Extracted {association_field} maps this line to "
                         "multiple resolved EST values"
                     )
-                elif len(mappings) == 1:
-                    mapping = mappings[0]
+                elif len(mapping_by_estimation) == 1:
+                    mapping = next(iter(mapping_by_estimation.values()))
                     association_counts[
                         "single_parent_fallback_count"
                     ] += 1
@@ -1858,7 +1882,7 @@ def build_extracted_po_document_detail_result(
                     raise ValueError(
                         "Cannot uniquely associate this line with one "
                         "resolved EST using its extracted EstimateNumber "
-                        "or ReferenceNumber"
+                        f"or {association_field}"
                     )
 
             detail_row = {

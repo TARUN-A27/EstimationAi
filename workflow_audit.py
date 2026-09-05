@@ -22,6 +22,7 @@ SENSITIVE_DETAIL_KEYS = {
     "po_document_details",
     "party_name",
     "reference_number",
+    "mapping_reference_number",
     "required_quantity",
     "count_name",
     "certification",

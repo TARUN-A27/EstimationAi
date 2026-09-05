@@ -1,0 +1,26 @@
+# V18 complete review archive manifest
+V18_REVIEW_ARCHIVE_MANIFEST.txt
+app.py
+po_content_validation.py
+workflow_audit.py
+requirements.txt
+.env.example
+templates/estimation.html
+migrate_po_details_v8.py
+migrate_po_details_v14.py
+test_ai_document_analysis_v16.py
+test_ai_document_analysis_v17.py
+test_ai_document_analysis_v18.py
+test_po_validation_v5.py
+test_po_validation_v6.py
+test_po_replacement_v7.py
+test_po_extracted_details_v8.py
+test_po_party_certificate_v9.py
+test_po_parent_independent_v10.py
+test_po_details_no_matching_v11.py
+test_po_extracted_lines_v12.py
+test_po_document_classification_v13.py
+test_po_partial_details_v14.py
+test_workflow_audit_v15.py
+tests/test_document_parsing.py
+tests/fixtures/azure_content_understanding_po_redacted.json

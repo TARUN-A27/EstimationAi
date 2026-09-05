@@ -199,7 +199,7 @@ class OrderLineAssociationV17Tests(unittest.TestCase):
             [174651, 174693],
         )
         self.assertEqual(
-            details["association_counts"]["reference_mapping_count"],
+            details["association_counts"]["legacy_reference_mapping_count"],
             2,
         )
 
