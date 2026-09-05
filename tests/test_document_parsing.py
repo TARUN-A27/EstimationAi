@@ -35,11 +35,11 @@ def test_mix_sheet_estimation_number(est_no):
     assert result["estimation_numbers"] == [est_no]
 
 
-def test_estimation_sheet_uses_only_semantic_est_fields():
-    result = normalize_content_understanding_result(
-        analysis("Estimation Sheet", [165772, 165773, 165774, 165775])
-    )
-    assert result["estimation_numbers"] == [165772, 165773, 165774, 165775]
+def test_estimation_sheet_primary_excludes_unrelated_table_est_fields():
+    raw = analysis("Estimation Sheet", [165773, 165774, 165775])
+    raw["contents"][0]["fields"]["PrimaryEstimationNumber"] = field(165772)
+    result = normalize_content_understanding_result(raw)
+    assert result["estimation_numbers"] == [165772]
     assert 107032 not in result["estimation_numbers"]
 
 

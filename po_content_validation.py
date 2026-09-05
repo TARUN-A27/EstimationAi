@@ -484,6 +484,76 @@ def parse_party_names(result_data: Mapping[str, Any]) -> list[str]:
     return ordered_unique(name for name in names if name)
 
 
+def parse_estimation_mappings(
+    result_data: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Parse semantic EST/reference pairs without altering stored values."""
+    mappings: list[dict[str, Any]] = []
+    for fields in content_fields(result_data):
+        mapping_field = named_field(
+            fields,
+            "EstimationMappings",
+            "EstimationMapping",
+            "EstimateMappings",
+            "EstimateMapping",
+            "ESTMappings",
+        )
+        if not isinstance(mapping_field, Mapping):
+            continue
+        for item in mapping_field.get("valueArray") or []:
+            if not isinstance(item, Mapping):
+                continue
+            value_object = item.get("valueObject") or {}
+            if not isinstance(value_object, Mapping):
+                continue
+            estimate_values = field_values(
+                named_field(
+                    value_object,
+                    "EstimateNumber",
+                    "EstimationNumber",
+                    "EstimateNo",
+                    "EstNo",
+                )
+            )
+            normalized_estimates = ordered_unique(
+                str(number)
+                for number in (
+                    normalize_estimation_number(value)
+                    for value in estimate_values
+                )
+                if number is not None
+            )
+            reference_numbers = ordered_unique(
+                value
+                for value in field_values(
+                    named_field(
+                        value_object,
+                        "ReferenceNumber",
+                        "ReferenceNo",
+                        "RefNumber",
+                        "RefNo",
+                    )
+                )
+                if value
+            )
+            mappings.append(
+                {
+                    "estimate_number": (
+                        int(normalized_estimates[0])
+                        if len(normalized_estimates) == 1
+                        else None
+                    ),
+                    "reference_number": (
+                        reference_numbers[0]
+                        if len(reference_numbers) == 1
+                        else None
+                    ),
+                    "reference_numbers": reference_numbers,
+                }
+            )
+    return mappings
+
+
 def normalize_document_type(value: Any) -> str:
     key = identifier_key(value)
     aliases = {
@@ -538,6 +608,7 @@ def normalize_content_understanding_result(
         raise ContentAnalysisError("AI document analysis returned no document content")
 
     type_values: list[str] = []
+    primary_estimation_values: list[Any] = []
     document_estimation_values: list[Any] = []
     warnings: list[str] = []
     raw_warnings = result_data.get("warnings") or []
@@ -571,12 +642,25 @@ def normalize_content_understanding_result(
         type_values.extend(
             field_values(named_field(fields, "DocumentType", "DocumentCategory"))
         )
+        primary_estimation_values.extend(
+            field_values(
+                named_field(
+                    fields,
+                    "PrimaryEstimationNumber",
+                    "PrimaryEstimateNumber",
+                    "PrimaryEstimationNo",
+                    "PrimaryEstimateNo",
+                    "PrimaryEstNo",
+                )
+            )
+        )
         for field_name in estimation_field_names:
             document_estimation_values.extend(
                 field_values(named_field(fields, field_name))
             )
 
     order_lines = parse_order_lines(result_data)
+    estimation_mappings = parse_estimation_mappings(result_data)
 
     document_types = ordered_unique(
         normalized
@@ -590,7 +674,21 @@ def normalize_content_understanding_result(
     else:
         document_type = "unknown"
 
-    document_estimation_numbers = ordered_unique(
+    primary_estimation_numbers = ordered_unique(
+        str(number)
+        for number in (
+            normalize_estimation_number(value)
+            for value in primary_estimation_values
+        )
+        if number is not None
+    )
+    primary_estimation_number = (
+        int(primary_estimation_numbers[0])
+        if len(primary_estimation_numbers) == 1
+        else None
+    )
+    primary_estimation_present = bool(primary_estimation_values)
+    legacy_estimation_numbers = ordered_unique(
         str(number)
         for number in (
             normalize_estimation_number(value)
@@ -607,11 +705,60 @@ def normalize_content_understanding_result(
         )
         if number is not None
     )
+    mapping_estimation_numbers = ordered_unique(
+        str(mapping["estimate_number"])
+        for mapping in estimation_mappings
+        if mapping.get("estimate_number") is not None
+    )
+
+    if document_type in {"estimation", "mix"}:
+        if primary_estimation_number is not None:
+            effective_estimation_numbers = [
+                str(primary_estimation_number)
+            ]
+        elif (
+            not primary_estimation_present
+            and len(legacy_estimation_numbers) == 1
+        ):
+            effective_estimation_numbers = legacy_estimation_numbers
+        else:
+            effective_estimation_numbers = []
+            if primary_estimation_present:
+                warnings.append(
+                    "Primary estimation value is invalid or ambiguous"
+                )
+            elif len(legacy_estimation_numbers) > 1:
+                warnings.append(
+                    "Multiple legacy estimation candidates require review"
+                )
+        document_estimation_numbers = effective_estimation_numbers
+    elif document_type == "po":
+        document_estimation_numbers = ordered_unique(
+            [*legacy_estimation_numbers, *mapping_estimation_numbers]
+        )
+        effective_estimation_numbers = ordered_unique(
+            [*document_estimation_numbers, *line_estimation_numbers]
+        )
+    else:
+        document_estimation_numbers = ordered_unique(
+            [*legacy_estimation_numbers, *mapping_estimation_numbers]
+        )
+        effective_estimation_numbers = []
+
     return {
         "document_type": document_type,
-        # Compatibility key: document-level semantic EST values only.
+        "primary_estimation_present": primary_estimation_present,
+        "primary_estimation_number": primary_estimation_number,
+        "estimation_mappings": estimation_mappings,
+        "legacy_estimation_numbers": [
+            int(value) for value in legacy_estimation_numbers
+        ],
+        "mapping_estimation_numbers": [
+            int(value) for value in mapping_estimation_numbers
+        ],
+        # Compatibility key: workflow-authoritative semantic EST values.
         "estimation_numbers": [
-            int(value) for value in document_estimation_numbers
+            int(value) for value in effective_estimation_numbers
         ],
         "document_estimation_numbers": [
             int(value) for value in document_estimation_numbers
@@ -671,6 +818,12 @@ def analyze_uploaded_document(
         "completed",
         "AI semantic fields extracted",
         {
+            "primary_estimation_present": (
+                normalized["primary_estimation_present"]
+            ),
+            "estimation_mapping_count": len(
+                normalized["estimation_mappings"]
+            ),
             "document_estimation_count": len(
                 normalized["document_estimation_numbers"]
             ),
@@ -686,6 +839,12 @@ def analyze_uploaded_document(
         "completed",
         "AI extraction normalization completed",
         {
+            "primary_estimation_present": (
+                normalized["primary_estimation_present"]
+            ),
+            "estimation_mapping_count": len(
+                normalized["estimation_mappings"]
+            ),
             "document_estimation_count": len(
                 normalized["document_estimation_numbers"]
             ),
@@ -1618,6 +1777,21 @@ def build_extracted_po_document_detail_result(
         mapping["estimation_number"]: mapping
         for mapping in mappings
     }
+    reference_to_estimations: dict[str, set[str]] = {}
+    for semantic_mapping in result_data.get("estimation_mappings") or []:
+        estimation_number = semantic_mapping.get("estimate_number")
+        if estimation_number is None:
+            continue
+        estimation_key = str(int(estimation_number))
+        if estimation_key not in mapping_by_estimation:
+            continue
+        for reference in semantic_mapping.get("reference_numbers") or []:
+            reference_key = identifier_key(reference)
+            if reference_key:
+                reference_to_estimations.setdefault(
+                    reference_key,
+                    set(),
+                ).add(estimation_key)
 
     def extracted_estimation_keys(values: Iterable[Any]) -> set[str]:
         keys: set[str] = set()
@@ -1635,30 +1809,56 @@ def build_extracted_po_document_detail_result(
 
     rows: list[dict[str, Any]] = []
     rejected_lines: list[dict[str, Any]] = []
+    association_counts = {
+        "direct_line_mapping_count": 0,
+        "reference_mapping_count": 0,
+        "single_parent_fallback_count": 0,
+    }
     for line_number, line in enumerate(order_lines, start=1):
         try:
             raw_estimate_values = line.get("estimate_number") or []
             estimate_keys = extracted_estimation_keys(raw_estimate_values)
-            if len(mappings) == 1:
-                mapping = mappings[0]
-                if raw_estimate_values and estimate_keys != {
-                    mapping["estimation_number"]
-                }:
-                    raise ValueError(
-                        "Extracted EstimateNumber does not match the "
-                        "single resolved PO parent"
-                    )
-            else:
-                if len(estimate_keys) != 1:
-                    raise ValueError(
-                        "Cannot uniquely associate this line with one "
-                        "resolved EST using its extracted EstimateNumber"
-                    )
+            if len(estimate_keys) > 1:
+                raise ValueError(
+                    "Extracted EstimateNumber is ambiguous on this line"
+                )
+            if len(estimate_keys) == 1:
                 estimate_key = next(iter(estimate_keys))
                 mapping = mapping_by_estimation.get(estimate_key)
                 if mapping is None:
                     raise ValueError(
                         "Extracted EstimateNumber has no resolved PO parent"
+                    )
+                association_counts["direct_line_mapping_count"] += 1
+            else:
+                reference_estimation_keys: set[str] = set()
+                for reference in line.get("reference_number") or []:
+                    reference_estimation_keys.update(
+                        reference_to_estimations.get(
+                            identifier_key(reference),
+                            set(),
+                        )
+                    )
+                if len(reference_estimation_keys) == 1:
+                    mapping = mapping_by_estimation[
+                        next(iter(reference_estimation_keys))
+                    ]
+                    association_counts["reference_mapping_count"] += 1
+                elif len(reference_estimation_keys) > 1:
+                    raise ValueError(
+                        "Extracted ReferenceNumber maps this line to "
+                        "multiple resolved EST values"
+                    )
+                elif len(mappings) == 1:
+                    mapping = mappings[0]
+                    association_counts[
+                        "single_parent_fallback_count"
+                    ] += 1
+                else:
+                    raise ValueError(
+                        "Cannot uniquely associate this line with one "
+                        "resolved EST using its extracted EstimateNumber "
+                        "or ReferenceNumber"
                     )
 
             detail_row = {
@@ -1704,7 +1904,11 @@ def build_extracted_po_document_detail_result(
                 }
             )
 
-    return {"rows": rows, "rejected_lines": rejected_lines}
+    return {
+        "rows": rows,
+        "rejected_lines": rejected_lines,
+        "association_counts": association_counts,
+    }
 
 
 def build_extracted_po_document_detail_rows(

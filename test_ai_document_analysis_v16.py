@@ -123,13 +123,13 @@ class NormalizationV16Tests(unittest.TestCase):
 
     def test_multiple_est_numbers_are_extracted_in_order(self):
         result = normalize_content_understanding_result(
-            response("estimation", [175535, 175536])
+            response("po", [175535, 175536])
         )
         self.assertEqual(result["estimation_numbers"], [175535, 175536])
 
     def test_exact_duplicate_est_numbers_are_removed(self):
         result = normalize_content_understanding_result(
-            response("mix", ["175535", "EST 175535", 175536])
+            response("po", ["175535", "EST 175535", 175536])
         )
         self.assertEqual(result["estimation_numbers"], [175535, 175536])
 

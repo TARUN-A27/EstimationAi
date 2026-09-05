@@ -2053,7 +2053,15 @@ def insert_regular_order_document(
             "content_understanding",
             "completed",
             f"Reused AI result containing {extracted_order_lines} order line(s)",
-            {"order_line_count": extracted_order_lines},
+            {
+                "order_line_count": extracted_order_lines,
+                "primary_estimation_present": (
+                    content_result.get("primary_estimation_present", False)
+                ),
+                "estimation_mapping_count": len(
+                    content_result.get("estimation_mappings") or []
+                ),
+            },
         )
 
     record_workflow_event(
@@ -2140,6 +2148,11 @@ def insert_regular_order_document(
             )
 
             po_detail_rows = []
+            association_counts = {
+                "direct_line_mapping_count": 0,
+                "reference_mapping_count": 0,
+                "single_parent_fallback_count": 0,
+            }
             if content_result is not None:
                 try:
                     record_workflow_event(
@@ -2156,6 +2169,9 @@ def insert_regular_order_document(
                     po_detail_rejections = detail_result[
                         "rejected_lines"
                     ]
+                    association_counts.update(
+                        detail_result.get("association_counts") or {}
+                    )
                     if po_detail_rejections:
                         app.logger.warning(
                             "PO DETAIL PARTIAL filename=%s "
@@ -2174,6 +2190,7 @@ def insert_regular_order_document(
                         ),
                         "Prepared independently insertable PO detail lines",
                         {
+                            **association_counts,
                             "prepared_row_count": len(po_detail_rows),
                             "rejected_line_count": len(
                                 po_detail_rejections
@@ -2214,6 +2231,7 @@ def insert_regular_order_document(
                 "regular_order_numbers": order_numbers,
                 "unmapped_estimation_count": len(rejected_estimations),
                 "excluded_parent_count": len(excluded_mappings),
+                **association_counts,
                 "detail_rows": po_detail_rows,
                 "detail_status": (
                     "REVIEW_REQUIRED"
@@ -2243,12 +2261,19 @@ def insert_regular_order_document(
             )
 
             audit_detail_summary = {
+                "primary_estimation_present": (
+                    content_result.get("primary_estimation_present", False)
+                ),
+                "estimation_mapping_count": len(
+                    content_result.get("estimation_mappings") or []
+                ),
                 "mapped_estimation_count": len(estimation_order_mappings),
                 "regular_order_count": len(order_numbers),
                 "unmapped_estimation_count": len(rejected_estimations),
                 "excluded_parent_count": len(excluded_mappings),
                 "prepared_row_count": len(po_detail_rows),
                 "rejected_line_count": len(po_detail_rejections),
+                **association_counts,
             }
 
             if workflow is not None:

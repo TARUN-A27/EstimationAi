@@ -13,6 +13,10 @@
           "type": "string",
           "valueString": "Purchase Order"
         },
+        "PrimaryEstimationNumber": {
+          "type": "string",
+          "valueString": "175535"
+        },
         "EstimationNumbers": {
           "type": "array",
           "valueArray": [
@@ -25,6 +29,24 @@
         "PartyName": {
           "type": "string",
           "valueString": "REDACTED PARTY"
+        },
+        "EstimationMappings": {
+          "type": "array",
+          "valueArray": [
+            {
+              "type": "object",
+              "valueObject": {
+                "EstimateNumber": {
+                  "type": "string",
+                  "valueString": "175535"
+                },
+                "ReferenceNumber": {
+                  "type": "string",
+                  "valueString": "REDACTED-REFERENCE"
+                }
+              }
+            }
+          ]
         },
         "OrderLines": {
           "type": "array",
