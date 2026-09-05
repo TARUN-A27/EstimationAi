@@ -1,5 +1,5 @@
 azure-cognitiveservices-vision-computervision
-azure-ai-contentunderstanding
+azure-ai-contentunderstanding==1.1.0
 azure-core
 Flask
 msrest

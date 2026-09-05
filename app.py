@@ -27,7 +27,7 @@ from pending_reports import (
     REGULAR_ORDER_ESTIMATION_DETAILS_QUERY,
 )
 from po_content_validation import (
-    analyze_po_document,
+    analyze_uploaded_document,
     build_extracted_po_document_detail_result,
 )
 from workflow_audit import WorkflowAuditStore
@@ -66,8 +66,8 @@ class DocumentValidationError(ValueError):
 
 WORKFLOW_STAGE_LABELS = {
     "uploaded": "Uploaded",
-    "ocr": "OCR completed",
-    "content_understanding": "Content Understanding",
+    "ocr": "AI document analysis",
+    "content_understanding": "AI document analysis",
     "validation": "PO detail preparation",
     "database_insert": "Database insertion",
 }
@@ -229,13 +229,17 @@ configure_oracle_client()
 
 
 def get_db_connection():
+    try:
+        port = int(required_env("SCM_DB_PORT"))
+    except ValueError as exc:
+        raise ConfigurationError("SCM_DB_PORT must be numeric") from exc
     dsn = oracledb.makedsn(
-        os.getenv("SCM_DB_HOST", "172.16.2.28"),
-        int(os.getenv("SCM_DB_PORT", "1521")),
-        service_name=os.getenv("SCM_DB_SERVICE", "ARUN"),
+        required_env("SCM_DB_HOST"),
+        port,
+        service_name=required_env("SCM_DB_SERVICE"),
     )
     return oracledb.connect(
-        user=os.getenv("SCM_DB_USER", "SCM"),
+        user=required_env("SCM_DB_USER"),
         password=required_env("SCM_DB_PASSWORD"),
         dsn=dsn,
     )
@@ -1397,6 +1401,136 @@ def existing_estimation_numbers(cursor, candidates: list[int]) -> list[int]:
     return [value for value in candidates if value in existing]
 
 
+def resolve_po_estimation_candidates(
+    cursor,
+    document_estimation_numbers: list[int],
+    line_estimation_numbers: list[int],
+    *,
+    expected_est_no: int | None = None,
+    expected_order_no: str | None = None,
+) -> dict:
+    """Resolve each AI EST independently without deriving new identities."""
+    document_numbers = unique(
+        int(value) for value in document_estimation_numbers
+    )
+    line_numbers = unique(int(value) for value in line_estimation_numbers)
+    candidates = unique([*document_numbers, *line_numbers])
+
+    if expected_est_no is not None and int(expected_est_no) not in document_numbers:
+        raise DocumentValidationError(
+            f"Selected EST No. {expected_est_no} was not returned in the "
+            "AI document-level EST fields. Nothing was inserted"
+        )
+
+    mapped = []
+    rejected_estimations = []
+    for estimation_no in candidates:
+        cursor.execute(
+            """
+            SELECT DISTINCT
+                TRIM(RORDERNO),
+                TRIM(REFORDERNO)
+            FROM REGULARORDER
+            WHERE ESTIMATIONNO = :estimation_no
+            """,
+            estimation_no=estimation_no,
+        )
+        rows = []
+        for row in cursor.fetchall():
+            regular_order_no = str(row[0] or "").strip()
+            reference_order_no = str(row[1] or "").strip()
+            if regular_order_no:
+                rows.append((regular_order_no, reference_order_no))
+
+        order_numbers = sorted({row[0] for row in rows})
+        if len(order_numbers) != 1:
+            rejected_estimations.append(
+                {
+                    "estimation_no": estimation_no,
+                    "source": (
+                        "document_and_line"
+                        if estimation_no in document_numbers
+                        and estimation_no in line_numbers
+                        else "document"
+                        if estimation_no in document_numbers
+                        else "line"
+                    ),
+                    "reason": (
+                        "NO_REGULARORDER_MAPPING"
+                        if not order_numbers
+                        else "AMBIGUOUS_REGULARORDER_MAPPING"
+                    ),
+                }
+            )
+            continue
+
+        order_no = order_numbers[0]
+        mapped.append(
+            {
+                "estimation_no": estimation_no,
+                "regular_order_number": order_no,
+                "reference_order_numbers": sorted(
+                    {
+                        reference
+                        for regular, reference in rows
+                        if regular == order_no and reference
+                    }
+                ),
+            }
+        )
+
+    excluded_mappings = []
+    if expected_order_no:
+        expected_key = str(expected_order_no).strip().upper()
+
+        def is_selected(mapping):
+            return expected_key in {
+                mapping["regular_order_number"].upper(),
+                *(
+                    value.upper()
+                    for value in mapping["reference_order_numbers"]
+                ),
+            }
+
+        selected_est_mapping = next(
+            (
+                mapping
+                for mapping in mapped
+                if mapping["estimation_no"] == int(expected_est_no)
+                and is_selected(mapping)
+            ),
+            None,
+        )
+        if selected_est_mapping is None:
+            raise DocumentValidationError(
+                "The AI-returned selected EST does not resolve to the "
+                f"selected order/reference {expected_order_no}. "
+                "Nothing was inserted"
+            )
+        retained = [mapping for mapping in mapped if is_selected(mapping)]
+        excluded_mappings = [
+            mapping for mapping in mapped if not is_selected(mapping)
+        ]
+    else:
+        retained = mapped
+
+    if not retained:
+        raise DocumentValidationError(
+            "No AI-extracted EST value maps uniquely to REGULARORDER. "
+            "Nothing was inserted"
+        )
+
+    return {
+        "mappings": retained,
+        "order_numbers": unique(
+            mapping["regular_order_number"] for mapping in retained
+        ),
+        "rejected_estimations": rejected_estimations,
+        "excluded_mappings": excluded_mappings,
+        "candidate_count": len(candidates),
+    }
+
+
 def insert_enquiry_document(
     filename: str,
     file_path: Path,
@@ -1430,18 +1564,10 @@ def insert_enquiry_document(
         expected_est_no = int(expected_est_no)
 
         if expected_est_no not in candidate_est_nos:
-            # The normal extraction may miss an edited or stamped
-            # EST number. Verify it visibly using targeted Azure OCR.
-            verified_est_no = extract_expected_po_estimation_number(
-                file_path=file_path,
-                expected_est_no=expected_est_no,
-                workflow=workflow,
+            raise DocumentValidationError(
+                f"Selected EST No. {expected_est_no} was not returned "
+                "by AI document analysis. Nothing was inserted"
             )
-
-            candidate_est_nos = unique([
-                *candidate_est_nos,
-                int(verified_est_no),
-            ])
 
 
     if not candidate_est_nos:
@@ -1829,9 +1955,10 @@ def insert_regular_order_document(
     expected_order_no: str | None = None,
     workflow: dict | None = None,
     validation_only: bool = False,
+    analysis_result: dict | None = None,
 ):
-    # Keep the argument for caller compatibility. The stamped estimation
-    # rows are extracted from the actual PDF/image, not generic OCR text.
+    # Keep the text argument for response/caller compatibility. Production
+    # identity and detail values come only from the shared AI analysis.
     _ = text
 
     record_workflow_event(
@@ -1870,40 +1997,28 @@ def insert_regular_order_document(
         {"file_size_bytes": len(blob_data)},
     )
 
-    if expected_est_no is None:
-        extracted_values = (
-            extract_po_stamp_estimation_numbers(
-                file_path,
-                workflow=workflow,
-            )
-        )
-    else:
-        extracted_values = [
-            extract_expected_po_estimation_number(
-                file_path,
-                expected_est_no,
-                workflow=workflow,
-            )
-        ]
-
-    estimation_numbers = []
-    seen_estimations = set()
-
-    for value in extracted_values:
-        try:
-            estimation_no = int(value)
-        except (TypeError, ValueError) as exc:
-            raise DocumentValidationError(
-                f"Invalid stamped Estimation No. value: {value!r}"
-            ) from exc
-
-        if estimation_no not in seen_estimations:
-            seen_estimations.add(estimation_no)
-            estimation_numbers.append(estimation_no)
-
-    if not estimation_numbers:
+    if not isinstance(analysis_result, dict):
         raise DocumentValidationError(
-            f"No stamped Estimation No. values were found in {filename}"
+            "AI document analysis result is unavailable for this PO"
+        )
+    document_estimation_numbers = unique(
+        int(value)
+        for value in analysis_result.get(
+            "document_estimation_numbers",
+            analysis_result.get("estimation_numbers") or [],
+        )
+    )
+    line_estimation_numbers = unique(
+        int(value)
+        for value in analysis_result.get("line_estimation_numbers") or []
+    )
+    extracted_estimation_numbers = unique(
+        [*document_estimation_numbers, *line_estimation_numbers]
+    )
+
+    if not extracted_estimation_numbers:
+        raise DocumentValidationError(
+            f"AI document analysis found no Estimation No. values in {filename}"
         )
 
     if workflow is not None:
@@ -1911,10 +2026,12 @@ def insert_regular_order_document(
             workflow,
             "ocr",
             "completed",
-            "OCR and stamped EST extraction completed",
+            "AI document analysis completed",
             {
-                "estimation_numbers": estimation_numbers,
-                "text_characters": len(text or ""),
+                "document_estimation_count": len(
+                    document_estimation_numbers
+                ),
+                "line_estimation_count": len(line_estimation_numbers),
             },
         )
 
@@ -1923,54 +2040,21 @@ def insert_regular_order_document(
             workflow,
             "content_understanding",
             "processing",
-            "Extracting PO fields",
+            "Using extracted PO fields from the shared AI result",
         )
 
-    content_result = None
+    content_result = analysis_result
     po_detail_error = None
     po_detail_rejections = []
-
-    try:
-        content_result = analyze_po_document(file_path)
-    except Exception as exc:
-        # PO parent persistence is independent from optional extracted
-        # details. Keep the extraction error for review and continue with
-        # the established EST -> RORDERNO parent workflow.
-        po_detail_error = str(exc)
-        if workflow is not None:
-            set_workflow_stage(
-                workflow,
-                "content_understanding",
-                "review_required",
-                f"PO details could not be extracted: {exc}",
-            )
-    else:
-        extracted_order_lines = sum(
-            len(
-                (
-                    (content.get("fields") or {})
-                    .get("OrderLines", {})
-                    .get("valueArray", [])
-                )
-            )
-            for content in content_result.get("contents") or []
-            if isinstance(content, dict)
+    extracted_order_lines = len(content_result.get("order_lines") or [])
+    if workflow is not None:
+        set_workflow_stage(
+            workflow,
+            "content_understanding",
+            "completed",
+            f"Reused AI result containing {extracted_order_lines} order line(s)",
+            {"order_line_count": extracted_order_lines},
         )
-
-        if workflow is not None:
-            set_workflow_stage(
-                workflow,
-                "content_understanding",
-                "completed",
-                f"Extracted {extracted_order_lines} order line(s)",
-                {
-                    "analyzer_id": os.getenv(
-                        "CONTENTUNDERSTANDING_ANALYZER_ID",
-                        "",
-                    ),
-                    "order_line_count": extracted_order_lines,
-                },
-            )
 
     record_workflow_event(
         workflow,
@@ -2005,160 +2089,54 @@ def insert_regular_order_document(
                     "Preparing extracted PO details",
                 )
 
-            estimation_order_mappings = []
-            order_numbers = []
-            seen_orders = set()
             record_workflow_event(
                 workflow,
                 "oracle_est_order_mapping",
                 "processing",
-                f"Resolving {len(estimation_numbers)} EST value(s) to regular orders",
-                {"estimation_count": len(estimation_numbers)},
+                "Resolving AI-extracted EST candidates independently",
+                {"candidate_count": len(extracted_estimation_numbers)},
             )
-
-            # Resolve every stamped estimation to its regular-order parent.
-            # This is identity/linkage resolution only; extracted PO values
-            # are not compared with CostEstimation or other master tables.
-            for estimation_no in estimation_numbers:
-                cursor.execute(
-                    """
-                    SELECT DISTINCT
-                        TRIM(RORDERNO),
-                        TRIM(REFORDERNO)
-                    FROM REGULARORDER
-                    WHERE ESTIMATIONNO = :estimation_no
-                    """,
-                    estimation_no=estimation_no,
-                )
-
-                order_mappings = []
-
-                for row in cursor.fetchall():
-                    regular_order_no = (
-                        str(row[0]).strip()
-                        if row[0] is not None
-                        else ""
-                    )
-                    reference_order_no = (
-                        str(row[1]).strip()
-                        if row[1] is not None
-                        else ""
-                    )
-
-                    if regular_order_no:
-                        order_mappings.append(
-                            {
-                                "regular_order_no": regular_order_no,
-                                "reference_order_no": (
-                                    reference_order_no
-                                ),
-                            }
-                        )
-
-                if expected_order_no:
-                    expected_value = (
-                        str(expected_order_no).strip().upper()
-                    )
-
-                    selected_mappings = [
-                        mapping
-                        for mapping in order_mappings
-                        if expected_value
-                        in {
-                            mapping["regular_order_no"].upper(),
-                            mapping["reference_order_no"].upper(),
-                        }
-                    ]
-
-                    if not selected_mappings:
-                        available_mappings = ", ".join(
-                            (
-                                "RORDERNO="
-                                f"{mapping['regular_order_no']}, "
-                                "REFORDERNO="
-                                f"{mapping['reference_order_no'] or '-'}"
-                            )
-                            for mapping in order_mappings
-                        ) or "none"
-
-                        raise DocumentValidationError(
-                            f"EST No. {estimation_no} in "
-                            f"{filename} does not belong to "
-                            "selected order/reference "
-                            f"{expected_order_no}. Oracle mappings: "
-                            f"{available_mappings}. "
-                            "Nothing was inserted"
-                        )
-
-                    order_mappings = selected_mappings
-
-                matching_orders = sorted(
-                    {
-                        mapping["regular_order_no"]
-                        for mapping in order_mappings
-                    }
-                )
-
-                if not matching_orders:
-                    raise DocumentValidationError(
-                        f"No REGULARORDER found for stamped "
-                        f"Estimation No. {estimation_no}"
-                    )
-
-                if len(matching_orders) != 1:
-                    raise DocumentValidationError(
-                        f"Estimation No. {estimation_no} maps to "
-                        f"multiple regular orders: "
-                        f"{', '.join(matching_orders)}"
-                    )
-
-                # Always insert the actual RORDERNO. REFORDERNO is
-                # accepted only as an alternate lookup value.
-                order_no = matching_orders[0]
-                estimation_order_mappings.append(
-                    {
-                        "estimation_no": estimation_no,
-                        "regular_order_number": order_no,
-                        "reference_order_numbers": sorted(
-                            {
-                                mapping["reference_order_no"]
-                                for mapping in order_mappings
-                                if (
-                                    mapping["regular_order_no"]
-                                    == order_no
-                                    and mapping["reference_order_no"]
-                                )
-                            }
-                        ),
-                    }
-                )
-
-                # One document row is required per distinct RORDERNO.
-                if order_no not in seen_orders:
-                    seen_orders.add(order_no)
-                    order_numbers.append(order_no)
+            resolution = resolve_po_estimation_candidates(
+                cursor,
+                document_estimation_numbers,
+                line_estimation_numbers,
+                expected_est_no=expected_est_no,
+                expected_order_no=expected_order_no,
+            )
+            estimation_order_mappings = resolution["mappings"]
+            order_numbers = resolution["order_numbers"]
+            rejected_estimations = resolution["rejected_estimations"]
+            excluded_mappings = resolution["excluded_mappings"]
+            mapping_review_required = bool(
+                rejected_estimations or excluded_mappings
+            )
+            estimation_numbers = [
+                mapping["estimation_no"]
+                for mapping in estimation_order_mappings
+            ]
 
             record_workflow_event(
                 workflow,
                 "oracle_est_order_mapping",
                 "completed",
-                "Resolved stamped EST values to regular-order parents",
+                "Resolved AI-extracted EST values to regular-order parents",
                 {
                     "estimation_count": len(estimation_order_mappings),
                     "regular_order_count": len(order_numbers),
+                    "unmapped_estimation_count": len(
+                        rejected_estimations
+                    ),
+                    "excluded_parent_count": len(excluded_mappings),
                 },
             )
-
-            app.logger.warning(
-                "PO PRE-INSERT filename=%s estimations=%s "
-                "estimation_order_mappings=%s distinct_orders=%s "
-                "expected_est_no=%s expected_order_no=%s",
+            app.logger.info(
+                "PO MAPPING filename=%s candidates=%s mapped=%s "
+                "unmapped=%s excluded_parents=%s",
                 filename,
-                estimation_numbers,
-                estimation_order_mappings,
-                order_numbers,
-                expected_est_no,
-                expected_order_no,
+                resolution["candidate_count"],
+                len(estimation_order_mappings),
+                len(rejected_estimations),
+                len(excluded_mappings),
             )
 
             po_detail_rows = []
@@ -2228,18 +2206,20 @@ def insert_regular_order_document(
                 )
 
             extraction_details = {
-                "analyzer_id": os.getenv(
+                "analyzer_configuration": content_result.get(
+                    "analyzer_configuration",
                     "CONTENTUNDERSTANDING_ANALYZER_ID",
-                    "",
                 ),
                 "estimation_numbers": estimation_numbers,
                 "regular_order_numbers": order_numbers,
+                "unmapped_estimation_count": len(rejected_estimations),
+                "excluded_parent_count": len(excluded_mappings),
                 "detail_rows": po_detail_rows,
                 "detail_status": (
                     "REVIEW_REQUIRED"
                     if po_detail_error
                     else "PARTIAL"
-                    if po_detail_rejections
+                    if po_detail_rejections or mapping_review_required
                     else "READY"
                 ),
                 "detail_error": po_detail_error,
@@ -2249,17 +2229,27 @@ def insert_regular_order_document(
                 "certificate_master_match": "SKIPPED",
             }
             app.logger.info(
-                "PO DETAILS PREPARED filename=%s analyzer=%s "
-                "estimations=%s prepared_row_count=%s "
-                "rejected_line_count=%s "
+                "PO DETAILS PREPARED filename=%s analyzer_config=%s "
+                "prepared_row_count=%s rejected_line_count=%s "
+                "unmapped_estimation_count=%s excluded_parent_count=%s "
                 "oracle_detail_value_comparison=SKIPPED "
                 "party_comparison=SKIPPED certificate_master=SKIPPED",
                 filename,
-                extraction_details["analyzer_id"],
-                estimation_numbers,
+                extraction_details["analyzer_configuration"],
                 len(po_detail_rows),
                 len(po_detail_rejections),
+                len(rejected_estimations),
+                len(excluded_mappings),
             )
+
+            audit_detail_summary = {
+                "mapped_estimation_count": len(estimation_order_mappings),
+                "regular_order_count": len(order_numbers),
+                "unmapped_estimation_count": len(rejected_estimations),
+                "excluded_parent_count": len(excluded_mappings),
+                "prepared_row_count": len(po_detail_rows),
+                "rejected_line_count": len(po_detail_rejections),
+            }
 
             if workflow is not None:
                 if po_detail_error:
@@ -2269,17 +2259,18 @@ def insert_regular_order_document(
                         "review_required",
                         "Parent PO can be stored; extracted details "
                         f"require review: {po_detail_error}",
-                        extraction_details,
+                        audit_detail_summary,
                     )
-                elif po_detail_rejections:
+                elif po_detail_rejections or mapping_review_required:
                     set_workflow_stage(
                         workflow,
                         "validation",
                         "review_required",
                         f"Prepared {len(po_detail_rows)} extracted line(s); "
-                        f"{len(po_detail_rejections)} line(s) could not be "
-                        "associated or represented safely",
-                        extraction_details,
+                        f"{len(po_detail_rejections)} line(s) and "
+                        f"{len(rejected_estimations) + len(excluded_mappings)} "
+                        "EST mapping(s) require review",
+                        audit_detail_summary,
                     )
                 else:
                     set_workflow_stage(
@@ -2288,7 +2279,7 @@ def insert_regular_order_document(
                         "completed",
                         "Extracted PO details prepared without "
                         "business-value matching",
-                        extraction_details,
+                        audit_detail_summary,
                     )
                 set_workflow_stage(
                     workflow,
@@ -2305,11 +2296,7 @@ def insert_regular_order_document(
                         "not_applicable",
                         "Validation-only mode: no database write was performed",
                         {
-                            "regular_order_numbers": order_numbers,
-                            "estimation_order_mappings": (
-                                estimation_order_mappings
-                            ),
-                            "po_document_details": po_detail_rows,
+                            **audit_detail_summary,
                         },
                     )
                 return {
@@ -2326,11 +2313,13 @@ def insert_regular_order_document(
                         "REVIEW_REQUIRED"
                         if po_detail_error
                         else "PARTIAL"
-                        if po_detail_rejections
+                        if po_detail_rejections or mapping_review_required
                         else "READY"
                     ),
                     "po_detail_error": po_detail_error,
                     "po_detail_rejected_lines": po_detail_rejections,
+                    "po_estimation_rejections": rejected_estimations,
+                    "po_excluded_parent_mappings": excluded_mappings,
                     "file_size_bytes": len(blob_data),
                 }
 
@@ -2892,7 +2881,7 @@ def insert_regular_order_document(
                         "review_required",
                         "PO parent was stored; extracted details require "
                         f"review: {po_detail_error}",
-                        extraction_details,
+                        audit_detail_summary,
                     )
                 app.logger.exception(
                     "PO parent stored but detail transaction requires "
@@ -2911,9 +2900,10 @@ def insert_regular_order_document(
             "REVIEW_REQUIRED"
             if po_detail_error
             else "PARTIAL"
-            if po_detail_rejections and inserted_detail_rows
+            if (po_detail_rejections or mapping_review_required)
+            and inserted_detail_rows
             else "REVIEW_REQUIRED"
-            if po_detail_rejections
+            if po_detail_rejections or mapping_review_required
             else "INSERTED"
             if inserted_detail_rows
             else "READY"
@@ -2946,28 +2936,26 @@ def insert_regular_order_document(
                 + (
                     "; extracted details require review"
                     if po_detail_error
-                    else "; some extracted lines require review"
-                    if po_detail_rejections
+                    else "; some extracted lines or EST mappings require review"
+                    if po_detail_rejections or mapping_review_required
                     else f"; detail rows inserted: "
                     f"{len(inserted_detail_rows)}"
                 ),
                 {
-                    "docids": [row["docid"] for row in processed_rows],
-                    "regular_order_numbers": [
-                        row["regular_order_number"]
-                        for row in processed_rows
-                    ],
-                    "replaced_order_numbers": replaced_order_numbers,
+                    "parent_row_count": len(processed_rows),
+                    "inserted_parent_count": inserted_parent_count,
+                    "replaced_parent_count": replaced_parent_count,
                     "old_detail_rows_deleted": deleted_detail_row_count,
-                    "estimation_order_mappings": (
-                        estimation_order_mappings
-                    ),
                     "po_detail_rows_inserted": len(
                         inserted_detail_rows
                     ),
                     "po_detail_lines_rejected": len(
                         po_detail_rejections
                     ),
+                    "unmapped_estimation_count": len(
+                        rejected_estimations
+                    ),
+                    "excluded_parent_count": len(excluded_mappings),
                 },
             )
 
@@ -2999,12 +2987,14 @@ def insert_regular_order_document(
             "po_detail_status": po_detail_status,
             "po_detail_error": po_detail_error,
             "po_detail_rejected_lines": po_detail_rejections,
+            "po_estimation_rejections": rejected_estimations,
+            "po_excluded_parent_mappings": excluded_mappings,
             "message": (
                 "PO parent stored; extracted details require review"
                 if po_detail_error
                 else "PO parent and available extracted details stored; "
-                "some lines require review"
-                if po_detail_rejections
+                "some lines or EST mappings require review"
+                if po_detail_rejections or mapping_review_required
                 else "PO parent and available extracted details stored"
             ),
             "file_size_bytes": len(blob_data),
@@ -3254,30 +3244,23 @@ def upload_files():
                     workflow,
                     "ocr",
                     "processing",
-                    "Extracting text and identifying the document",
+                    "Analyzing PDF and identifying the document",
                 )
-                text = extract_pdf_text(
+                analysis_result = analyze_uploaded_document(
                     temporary_path,
-                    workflow=workflow,
+                    expected_document_type=expected_document_type,
+                    audit=lambda stage, status, message, details=None: (
+                        record_workflow_event(
+                            workflow,
+                            stage,
+                            status,
+                            message,
+                            details,
+                        )
+                    ),
                 )
-
-                if not text:
-                    raise DocumentValidationError(
-                        "No text could be extracted"
-                    )
-
-                record_workflow_event(
-                    workflow,
-                    "document_classification",
-                    "processing",
-                    "Classifying document from OCR content",
-                )
-                document_type = classify_document(text)
-
-                # OCR content is authoritative when it identifies a known
-                # type. For otherwise unknown scans, use explicit PO/LM,
-                # mixing, or estimation markers from the filename.
-                classification_source = "ocr"
+                document_type = analysis_result["document_type"]
+                classification_source = analysis_result["analysis_source"]
                 if document_type == "unknown":
                     document_type = filename_document_type(filename)
                     classification_source = "filename"
@@ -3301,18 +3284,22 @@ def upload_files():
                     workflow,
                     "ocr",
                     "completed",
-                    "OCR text extraction completed",
+                    "AI document analysis completed",
                     {
                         "document_type": document_type,
-                        "text_characters": len(text),
+                        "estimation_count": len(
+                            analysis_result["estimation_numbers"]
+                        ),
+                        "order_line_count": len(
+                            analysis_result["order_lines"]
+                        ),
                     },
                 )
 
                 if document_type in {"unknown", "ambiguous"}:
                     raise DocumentValidationError(
-                        "Document type could not be identified uniquely "
-                        "from the extracted PDF text and filename. Expected "
-                        "MIXING, CUSTOMER NAME, PO NO, LM NO, or LMO NO"
+                        "AI document analysis could not identify this PDF "
+                        "reliably. The document requires review"
                     )
 
                 if (
@@ -3329,20 +3316,21 @@ def upload_files():
                     inserted = insert_regular_order_document(
                         filename=filename,
                         file_path=temporary_path,
-                        text=text,
+                        text="",
                         remarks=remarks,
                         system_name=system_name,
                         expected_est_no=expected_est_no,
                         expected_order_no=expected_order_no,
                         workflow=workflow,
                         validation_only=validation_only,
+                        analysis_result=analysis_result,
                     )
                 else:
                     set_workflow_stage(
                         workflow,
                         "content_understanding",
-                        "not_applicable",
-                        "PO field extraction is not required for this document type",
+                        "completed",
+                        "AI semantic fields are ready for this document",
                     )
                     set_workflow_stage(
                         workflow,
@@ -3350,10 +3338,7 @@ def upload_files():
                         "not_applicable",
                         "PO detail preparation is not required",
                     )
-                    candidates = extract_estimation_numbers(
-                        text,
-                        document_type,
-                    )
+                    candidates = analysis_result["estimation_numbers"]
 
                     app.logger.warning(
                         "UPLOAD DEBUG filename=%s document_type=%s candidates=%s expected_est_no=%s",
@@ -3375,7 +3360,7 @@ def upload_files():
                             "document_rows_inserted": 0,
                             "detected_estimation_numbers": candidates,
                             "message": (
-                                "OCR completed in read-only mode; "
+                                "AI document analysis completed in read-only mode; "
                                 "company staff must enable insertion"
                             ),
                         }

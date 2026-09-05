@@ -100,13 +100,12 @@ class PoDocumentClassificationV13Tests(unittest.TestCase):
             "unknown",
         )
 
-    def test_upload_route_uses_filename_only_after_unknown_ocr(self) -> None:
+    def test_upload_route_uses_filename_only_after_unknown_ai_result(self) -> None:
         source = APP_PATH.read_text(encoding="utf-8")
-        expected = (
-            'document_type = classify_document(text)\n\n'
-            '                # OCR content is authoritative'
+        self.assertIn(
+            'document_type = analysis_result["document_type"]',
+            source,
         )
-        self.assertIn(expected, source)
         self.assertIn(
             'if document_type == "unknown":\n'
             '                    document_type = '

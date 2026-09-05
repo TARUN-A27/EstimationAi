@@ -21,6 +21,54 @@ from typing import Any
 
 MONEY_QUANTUM = Decimal("0.01")
 RATE_TOLERANCE = Decimal("0.01")
+CONTENT_UNDERSTANDING_SOURCE = "azure_ai_content_understanding"
+
+
+class ContentAnalysisError(RuntimeError):
+    """A safe, user-facing Content Understanding workflow failure."""
+
+
+def _audit(
+    audit: Any,
+    stage: str,
+    status: str,
+    message: str,
+    details=None,
+) -> None:
+    if audit is None:
+        return
+    try:
+        audit(stage, status, message, details)
+    except Exception:
+        # Workflow logging is deliberately best-effort.
+        return
+
+
+def analyzer_configuration(
+    expected_document_type: str | None,
+) -> tuple[str, str]:
+    """Resolve an analyzer without exposing or hardcoding its identifier."""
+    analyzer_names = {
+        "estimation": "CONTENTUNDERSTANDING_ESTIMATION_ANALYZER_ID",
+        "mix": "CONTENTUNDERSTANDING_MIXING_ANALYZER_ID",
+        "po": "CONTENTUNDERSTANDING_PO_ANALYZER_ID",
+    }
+    candidates: list[str] = []
+    if expected_document_type in analyzer_names:
+        candidates.append(analyzer_names[expected_document_type])
+    candidates.extend(
+        [
+            "CONTENTUNDERSTANDING_ROUTER_ANALYZER_ID",
+            "CONTENTUNDERSTANDING_ANALYZER_ID",
+        ]
+    )
+    for environment_name in candidates:
+        analyzer_id = os.getenv(environment_name, "").strip()
+        if analyzer_id:
+            return analyzer_id, environment_name
+    raise ContentAnalysisError(
+        "AI document analysis is not configured for this document workflow"
+    )
 
 ORACLE_EXPECTED_VALUES_QUERY = """
     SELECT
@@ -71,64 +119,204 @@ def to_plain(value: Any) -> Any:
     return str(value)
 
 
-def analyze_po_document(document_path: Path) -> dict[str, Any]:
-    """Run the configured custom analyzer and return plain JSON data."""
+def analyze_po_document(
+    document_path: Path,
+    *,
+    analyzer_id: str | None = None,
+    analyzer_config_name: str = "CONTENTUNDERSTANDING_ANALYZER_ID",
+    audit: Any = None,
+) -> dict[str, Any]:
+    """Submit the original document bytes and return the plain AI response."""
     try:
         from azure.ai.contentunderstanding import ContentUnderstandingClient
         from azure.core.credentials import AzureKeyCredential
-        from azure.core.exceptions import HttpResponseError
     except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Azure Content Understanding dependency is missing. Install "
-            "azure-ai-contentunderstanding in the application environment"
+        raise ContentAnalysisError(
+            "AI document analysis is unavailable in the application environment"
         ) from exc
 
     endpoint = os.getenv("CONTENTUNDERSTANDING_ENDPOINT", "").strip()
     key = os.getenv("CONTENTUNDERSTANDING_KEY", "").strip()
-    analyzer_id = os.getenv("CONTENTUNDERSTANDING_ANALYZER_ID", "").strip()
+    analyzer_id = analyzer_id or os.getenv(analyzer_config_name, "").strip()
     missing = [
         name
         for name, value in (
             ("CONTENTUNDERSTANDING_ENDPOINT", endpoint),
             ("CONTENTUNDERSTANDING_KEY", key),
-            ("CONTENTUNDERSTANDING_ANALYZER_ID", analyzer_id),
+            (analyzer_config_name, analyzer_id),
         )
         if not value
     ]
     if missing:
-        raise RuntimeError(
-            "Missing Content Understanding configuration: "
-            + ", ".join(missing)
+        raise ContentAnalysisError(
+            "AI document analysis configuration is incomplete"
         )
 
     document_path = Path(document_path)
+    if not document_path.is_file():
+        raise ContentAnalysisError(
+            "The uploaded PDF is unavailable for analysis"
+        )
+    if document_path.suffix.lower() != ".pdf":
+        raise ContentAnalysisError("AI document analysis accepts PDF uploads only")
     mime_type = (
         mimetypes.guess_type(document_path.name)[0]
         or "application/octet-stream"
     )
-    client = ContentUnderstandingClient(
-        endpoint=endpoint.rstrip("/"),
-        credential=AzureKeyCredential(key),
-        api_version="2025-11-01",
-    )
     try:
+        request_timeout = float(
+            os.getenv("CONTENTUNDERSTANDING_REQUEST_TIMEOUT_SECONDS", "30")
+        )
+        analysis_timeout = float(
+            os.getenv("CONTENTUNDERSTANDING_ANALYSIS_TIMEOUT_SECONDS", "300")
+        )
+        if request_timeout <= 0 or analysis_timeout <= 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ContentAnalysisError(
+            "AI document analysis timeout configuration is invalid"
+        ) from exc
+
+    client = None
+    request_accepted = False
+    try:
+        client = ContentUnderstandingClient(
+            endpoint=endpoint.rstrip("/"),
+            credential=AzureKeyCredential(key),
+            api_version="2025-11-01",
+            polling_interval=2,
+            connection_timeout=request_timeout,
+            read_timeout=request_timeout,
+        )
+        _audit(
+            audit,
+            "ai_analysis_request",
+            "processing",
+            "AI analysis request started",
+            {"analyzer_configuration": analyzer_config_name},
+        )
+        pdf_bytes = document_path.read_bytes()
+        if not pdf_bytes:
+            raise ContentAnalysisError("The uploaded PDF is empty")
+        _audit(
+            audit,
+            "ai_pdf_submission",
+            "processing",
+            "Submitting PDF directly to the AI analyzer",
+            {"file_size_bytes": len(pdf_bytes)},
+        )
         poller = client.begin_analyze_binary(
             analyzer_id=analyzer_id,
-            binary_input=document_path.read_bytes(),
+            binary_input=pdf_bytes,
             content_type=mime_type,
         )
-        return to_plain(poller.result())
-    except HttpResponseError as exc:
-        status_code = getattr(exc, "status_code", "unknown")
-        error = getattr(exc, "error", None)
-        error_code = getattr(error, "code", None) or "unknown"
-        message = getattr(exc, "message", None) or str(exc)
-        raise RuntimeError(
-            "Content Understanding request failed "
-            f"(HTTP {status_code}, code {error_code}): {message}"
+        request_accepted = True
+        _audit(audit, "ai_pdf_submission", "completed", "PDF submitted")
+        _audit(
+            audit,
+            "ai_request_accepted",
+            "completed",
+            "Analyzer request accepted",
+        )
+        _audit(
+            audit,
+            "ai_polling",
+            "processing",
+            "AI analysis polling started",
+        )
+        result_data = to_plain(poller.result(timeout=analysis_timeout))
+        status_member = getattr(poller, "status", "succeeded")
+        status = str(
+            status_member() if callable(status_member) else status_member
+        ).lower()
+        if status in {"failed", "canceled", "cancelled"}:
+            _audit(
+                audit,
+                "ai_polling",
+                "failed",
+                "AI analysis polling ended without success",
+            )
+            _audit(
+                audit,
+                "ai_response",
+                "failed",
+                "AI analyzer returned a failed or cancelled operation",
+            )
+            _audit(
+                audit,
+                "ai_analysis_request",
+                "failed",
+                "AI analysis request did not complete",
+            )
+            raise ContentAnalysisError(
+                "AI document analysis did not complete successfully"
+            )
+        _audit(
+            audit,
+            "ai_polling",
+            "completed",
+            "AI analysis polling completed",
+        )
+        _audit(audit, "ai_response", "completed", "AI response received")
+        _audit(
+            audit,
+            "ai_analysis_request",
+            "completed",
+            "AI analysis request completed",
+        )
+        return result_data
+    except TimeoutError as exc:
+        _audit(
+            audit,
+            "ai_polling",
+            "failed",
+            "AI document analysis timed out",
+        )
+        _audit(
+            audit,
+            "ai_response",
+            "failed",
+            "AI response was not received before the timeout",
+        )
+        _audit(
+            audit,
+            "ai_analysis_request",
+            "failed",
+            "AI analysis request timed out",
+        )
+        raise ContentAnalysisError("AI document analysis timed out") from exc
+    except ContentAnalysisError:
+        raise
+    except Exception as exc:
+        if not request_accepted:
+            _audit(
+                audit,
+                "ai_pdf_submission",
+                "failed",
+                "PDF submission to the AI analyzer failed",
+            )
+            _audit(
+                audit,
+                "ai_request_accepted",
+                "failed",
+                "AI analyzer did not accept the request",
+            )
+        _audit(audit, "ai_response", "failed", "AI document analysis failed")
+        _audit(
+            audit,
+            "ai_analysis_request",
+            "failed",
+            "AI analysis request failed",
+        )
+        raise ContentAnalysisError(
+            "AI document analysis failed; the upload was not processed"
         ) from exc
     finally:
-        client.close()
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def ordered_unique(values: Iterable[str]) -> list[str]:
@@ -168,6 +356,15 @@ def first_field_value(field: Any) -> str | None:
     return values[0] if values else None
 
 
+def named_field(fields: Mapping[str, Any], *names: str) -> Any:
+    by_key = {identifier_key(key): value for key, value in fields.items()}
+    for name in names:
+        value = by_key.get(identifier_key(name))
+        if value is not None:
+            return value
+    return None
+
+
 def content_fields(result_data: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
     for content in result_data.get("contents") or []:
         if not isinstance(content, Mapping):
@@ -180,7 +377,9 @@ def content_fields(result_data: Mapping[str, Any]) -> Iterable[Mapping[str, Any]
 def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
     order_lines: list[dict[str, Any]] = []
     for fields in content_fields(result_data):
-        order_lines_field = fields.get("OrderLines") or {}
+        order_lines_field = (
+            named_field(fields, "OrderLines", "OrderLineItems") or {}
+        )
         if not isinstance(order_lines_field, Mapping):
             continue
         for item in order_lines_field.get("valueArray") or []:
@@ -195,24 +394,34 @@ def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
                         value_object.get("SerialNumber")
                     ),
                     "estimate_number": field_values(
-                        value_object.get("EstimateNumber")
-                        or value_object.get("EstimationNumber")
-                        or value_object.get("EstimateNo")
-                        or value_object.get("EstNo")
+                        named_field(
+                            value_object,
+                            "EstimateNumber",
+                            "EstimationNumber",
+                            "EstimateNo",
+                            "EstNo",
+                        )
                     ),
-                    "count": field_values(value_object.get("Count")),
+                    "party_name": field_values(
+                        named_field(value_object, "PartyName")
+                    ),
+                    "count": field_values(
+                        named_field(value_object, "Count", "CountName")
+                    ),
                     "required_quantity": field_values(
-                        value_object.get("RequiredQuantity")
+                        named_field(value_object, "RequiredQuantity")
                     ),
                     "reference_number": field_values(
-                        value_object.get("ReferenceNumber")
+                        named_field(value_object, "ReferenceNumber")
                     ),
                     "confirm_rate": field_values(
-                        value_object.get("ConfirmRate")
+                        named_field(value_object, "NetRate", "ConfirmRate")
                     ),
                     "certification": field_values(
-                        value_object.get(
-                            "CertificateRateIncludedHeatSettings"
+                        named_field(
+                            value_object,
+                            "Certification",
+                            "CertificateRateIncludedHeatSettings",
                         )
                     ),
                 }
@@ -271,8 +480,223 @@ def parse_tax_details(result_data: Mapping[str, Any]) -> list[dict[str, str]]:
 def parse_party_names(result_data: Mapping[str, Any]) -> list[str]:
     names: list[str] = []
     for fields in content_fields(result_data):
-        names.extend(field_values(fields.get("PartyName")))
+        names.extend(field_values(named_field(fields, "PartyName")))
     return ordered_unique(name for name in names if name)
+
+
+def normalize_document_type(value: Any) -> str:
+    key = identifier_key(value)
+    aliases = {
+        "EST": "estimation",
+        "ESTIMATION": "estimation",
+        "ESTIMATIONSHEET": "estimation",
+        "MIX": "mix",
+        "MIXING": "mix",
+        "MIXINGSHEET": "mix",
+        "PO": "po",
+        "PURCHASEORDER": "po",
+        "PURCHASEORDERSHEET": "po",
+        "FULLPURCHASEORDER": "po",
+        "FULLPURCHASEORDERSHEET": "po",
+        "PODOCUMENT": "po",
+        "POSHEET": "po",
+        "UNKNOWN": "unknown",
+        "OTHER": "unknown",
+    }
+    return aliases.get(key, "unknown")
+
+
+def normalize_estimation_number(value: Any) -> int | None:
+    """Normalize one semantic EST field without mining arbitrary text."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        digits = str(value)
+    elif isinstance(value, float) and value.is_integer():
+        digits = str(int(value))
+    else:
+        text = str(value).strip().replace(",", "")
+        matches = re.findall(r"(?<!\d)\d{5,7}(?!\d)", text)
+        if len(matches) != 1:
+            return None
+        digits = matches[0]
+    if not re.fullmatch(r"\d{5,7}", digits):
+        return None
+    return int(digits)
+
+
+def normalize_content_understanding_result(
+    result_data: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Convert the configured analyzer response to the production contract."""
+    if not isinstance(result_data, Mapping):
+        raise ContentAnalysisError(
+            "AI document analysis returned a malformed response"
+        )
+    contents = result_data.get("contents")
+    if not isinstance(contents, list) or not contents:
+        raise ContentAnalysisError("AI document analysis returned no document content")
+
+    type_values: list[str] = []
+    document_estimation_values: list[Any] = []
+    warnings: list[str] = []
+    raw_warnings = result_data.get("warnings") or []
+    if isinstance(raw_warnings, list):
+        warnings.extend("Analyzer reported a warning" for _ in raw_warnings)
+
+    estimation_field_names = (
+        "EstimationNumbers",
+        "EstimateNumbers",
+        "ESTNumbers",
+        "ESTNumber",
+        "EstimationNumber",
+        "EstimateNumber",
+        "EstimationNo",
+        "EstimateNo",
+        "EstNo",
+    )
+    for content in contents:
+        if not isinstance(content, Mapping):
+            raise ContentAnalysisError(
+                "AI document analysis returned malformed content"
+            )
+        category = content.get("category")
+        if category:
+            type_values.append(str(category))
+        fields = content.get("fields") or {}
+        if not isinstance(fields, Mapping):
+            raise ContentAnalysisError(
+                "AI document analysis returned malformed fields"
+            )
+        type_values.extend(
+            field_values(named_field(fields, "DocumentType", "DocumentCategory"))
+        )
+        for field_name in estimation_field_names:
+            document_estimation_values.extend(
+                field_values(named_field(fields, field_name))
+            )
+
+    order_lines = parse_order_lines(result_data)
+
+    document_types = ordered_unique(
+        normalized
+        for normalized in (normalize_document_type(value) for value in type_values)
+        if normalized != "unknown"
+    )
+    if len(document_types) > 1:
+        document_type = "ambiguous"
+    elif document_types:
+        document_type = document_types[0]
+    else:
+        document_type = "unknown"
+
+    document_estimation_numbers = ordered_unique(
+        str(number)
+        for number in (
+            normalize_estimation_number(value)
+            for value in document_estimation_values
+        )
+        if number is not None
+    )
+    line_estimation_numbers = ordered_unique(
+        str(number)
+        for line in order_lines
+        for number in (
+            normalize_estimation_number(value)
+            for value in (line.get("estimate_number") or [])
+        )
+        if number is not None
+    )
+    return {
+        "document_type": document_type,
+        # Compatibility key: document-level semantic EST values only.
+        "estimation_numbers": [
+            int(value) for value in document_estimation_numbers
+        ],
+        "document_estimation_numbers": [
+            int(value) for value in document_estimation_numbers
+        ],
+        "line_estimation_numbers": [
+            int(value) for value in line_estimation_numbers
+        ],
+        "order_lines": order_lines,
+        "party_names": parse_party_names(result_data),
+        "analysis_source": CONTENT_UNDERSTANDING_SOURCE,
+        "warnings": warnings,
+    }
+
+
+def analyze_uploaded_document(
+    document_path: Path,
+    *,
+    expected_document_type: str | None = None,
+    audit: Any = None,
+) -> dict[str, Any]:
+    """Single paid-analysis boundary used by every upload workflow."""
+    analyzer_id, config_name = analyzer_configuration(expected_document_type)
+    raw_result = analyze_po_document(
+        document_path,
+        analyzer_id=analyzer_id,
+        analyzer_config_name=config_name,
+        audit=audit,
+    )
+    try:
+        normalized = normalize_content_understanding_result(raw_result)
+    except ContentAnalysisError:
+        _audit(
+            audit,
+            "ai_normalization",
+            "failed",
+            "AI response normalization failed",
+        )
+        raise
+    normalized["analyzer_configuration"] = config_name
+    _audit(
+        audit,
+        "document_classification",
+        (
+            "completed"
+            if normalized["document_type"] not in {"unknown", "ambiguous"}
+            else "failed"
+        ),
+        f"AI classified document as {normalized['document_type']}",
+        {
+            "document_type": normalized["document_type"],
+            "classification_source": CONTENT_UNDERSTANDING_SOURCE,
+        },
+    )
+    _audit(
+        audit,
+        "ai_extraction_counts",
+        "completed",
+        "AI semantic fields extracted",
+        {
+            "document_estimation_count": len(
+                normalized["document_estimation_numbers"]
+            ),
+            "line_estimation_count": len(
+                normalized["line_estimation_numbers"]
+            ),
+            "order_line_count": len(normalized["order_lines"]),
+        },
+    )
+    _audit(
+        audit,
+        "ai_normalization",
+        "completed",
+        "AI extraction normalization completed",
+        {
+            "document_estimation_count": len(
+                normalized["document_estimation_numbers"]
+            ),
+            "line_estimation_count": len(
+                normalized["line_estimation_numbers"]
+            ),
+            "order_line_count": len(normalized["order_lines"]),
+            "warning_count": len(normalized["warnings"]),
+        },
+    )
+    return normalized
 
 
 def identifier_key(value: Any) -> str:
@@ -1138,13 +1562,19 @@ def build_extracted_po_document_detail_result(
 
     # Production detail storage preserves the analyzer output. The legacy
     # sanitization/comparison path remains available for diagnostics only.
-    order_lines = parse_order_lines(result_data)
+    if (
+        result_data.get("analysis_source") == CONTENT_UNDERSTANDING_SOURCE
+        and isinstance(result_data.get("order_lines"), list)
+    ):
+        order_lines = list(result_data["order_lines"])
+        party_names = list(result_data.get("party_names") or [])
+    else:
+        order_lines = parse_order_lines(result_data)
+        party_names = parse_party_names(result_data)
     if not order_lines:
         raise ValueError("Content Understanding returned no OrderLines")
     if not mappings:
         raise ValueError("No stamped EST-to-order mappings were resolved")
-
-    party_names = parse_party_names(result_data)
 
     def joined_values(
         values: Iterable[Any],
@@ -1192,19 +1622,12 @@ def build_extracted_po_document_detail_result(
     def extracted_estimation_keys(values: Iterable[Any]) -> set[str]:
         keys: set[str] = set()
         for value in values:
-            # Content Understanding can return an integer, a numeric string,
-            # or labelled text such as "Est. No. 175164". Only numbers that
-            # resolve to a stamped EST mapping are accepted as linkage keys.
-            for token in re.findall(r"\d+", str(value).replace(",", "")):
-                try:
-                    key = str(int(token))
-                except ValueError:
-                    continue
-                if key in mapping_by_estimation:
-                    keys.add(key)
+            number = normalize_estimation_number(value)
+            if number is not None:
+                keys.add(str(number))
         return keys
 
-    party_name = joined_values(
+    document_party_name = joined_values(
         party_names,
         field_name="PartyName",
         maximum_length=300,
@@ -1214,25 +1637,40 @@ def build_extracted_po_document_detail_result(
     rejected_lines: list[dict[str, Any]] = []
     for line_number, line in enumerate(order_lines, start=1):
         try:
+            raw_estimate_values = line.get("estimate_number") or []
+            estimate_keys = extracted_estimation_keys(raw_estimate_values)
             if len(mappings) == 1:
                 mapping = mappings[0]
+                if raw_estimate_values and estimate_keys != {
+                    mapping["estimation_number"]
+                }:
+                    raise ValueError(
+                        "Extracted EstimateNumber does not match the "
+                        "single resolved PO parent"
+                    )
             else:
-                estimate_keys = extracted_estimation_keys(
-                    line.get("estimate_number") or []
-                )
                 if len(estimate_keys) != 1:
                     raise ValueError(
                         "Cannot uniquely associate this line with one "
-                        "stamped EST using its extracted EstimateNumber"
+                        "resolved EST using its extracted EstimateNumber"
                     )
-                mapping = mapping_by_estimation[next(iter(estimate_keys))]
+                estimate_key = next(iter(estimate_keys))
+                mapping = mapping_by_estimation.get(estimate_key)
+                if mapping is None:
+                    raise ValueError(
+                        "Extracted EstimateNumber has no resolved PO parent"
+                    )
 
             detail_row = {
                 "estimation_number": int(mapping["estimation_number"]),
                 "regular_order_number": mapping[
                     "regular_order_number"
                 ],
-                "party_name": party_name,
+                "party_name": joined_values(
+                    line.get("party_name") or [],
+                    field_name=f"PartyName on line {line_number}",
+                    maximum_length=300,
+                ) or document_party_name,
                 "reference_number": joined_values(
                     line.get("reference_number") or [],
                     field_name=f"ReferenceNumber on line {line_number}",

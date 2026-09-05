@@ -1,6 +1,7 @@
 # Secrets and configuration
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 

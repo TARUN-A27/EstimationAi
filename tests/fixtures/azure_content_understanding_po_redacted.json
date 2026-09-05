@@ -1,0 +1,66 @@
+{
+  "analyzerId": "redacted-analyzer",
+  "apiVersion": "2025-11-01",
+  "createdAt": "2026-01-01T00:00:00Z",
+  "stringEncoding": "codePoint",
+  "warnings": [],
+  "contents": [
+    {
+      "kind": "document",
+      "category": "po",
+      "fields": {
+        "DocumentType": {
+          "type": "string",
+          "valueString": "Purchase Order"
+        },
+        "EstimationNumbers": {
+          "type": "array",
+          "valueArray": [
+            {
+              "type": "integer",
+              "valueInteger": 175535
+            }
+          ]
+        },
+        "PartyName": {
+          "type": "string",
+          "valueString": "REDACTED PARTY"
+        },
+        "OrderLines": {
+          "type": "array",
+          "valueArray": [
+            {
+              "type": "object",
+              "valueObject": {
+                "EstimateNumber": {
+                  "type": "integer",
+                  "valueInteger": 175535
+                },
+                "ReferenceNumber": {
+                  "type": "string",
+                  "valueString": "REDACTED-REFERENCE"
+                },
+                "RequiredQuantity": {
+                  "type": "number",
+                  "valueNumber": 100
+                },
+                "CountName": {
+                  "type": "string",
+                  "valueString": "REDACTED-COUNT"
+                },
+                "Certification": {
+                  "type": "string",
+                  "valueString": "REDACTED-CERTIFICATION"
+                },
+                "NetRate": {
+                  "type": "number",
+                  "valueNumber": 500
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
