@@ -626,6 +626,8 @@ def normalize_content_understanding_result(
         warnings.extend("Analyzer reported a warning" for _ in raw_warnings)
 
     estimation_field_names = (
+        "EstimationReportNumbers",
+        "EstimationReportEstNumbers",
         "EstimationNumbers",
         "EstimateNumbers",
         "ESTNumbers",
@@ -721,7 +723,29 @@ def normalize_content_understanding_result(
         if mapping.get("estimate_number") is not None
     )
 
-    if document_type in {"estimation", "mix"}:
+    if document_type == "estimation":
+        # Estimation PDFs are multi-row reports, not single-estimate
+        # documents. Preserve every semantic EST returned from the report
+        # table. PrimaryEstimationNumber is accepted for compatibility, but
+        # it must never hide the remaining table rows.
+        document_estimation_numbers = ordered_unique(
+            [
+                *(
+                    [str(primary_estimation_number)]
+                    if primary_estimation_number is not None
+                    else []
+                ),
+                *legacy_estimation_numbers,
+                *line_estimation_numbers,
+            ]
+        )
+        effective_estimation_numbers = document_estimation_numbers
+        if primary_estimation_present and primary_estimation_number is None:
+            warnings.append(
+                "Primary estimation value is invalid or ambiguous; "
+                "valid estimation report rows were preserved"
+            )
+    elif document_type == "mix":
         if primary_estimation_number is not None:
             effective_estimation_numbers = [
                 str(primary_estimation_number)
@@ -1787,8 +1811,51 @@ def build_extracted_po_document_detail_result(
         mapping["estimation_number"]: mapping
         for mapping in mappings
     }
+    ordered_mapping_fallbacks: list[dict[str, Any]] | None = None
+    semantic_mappings = list(
+        result_data.get("estimation_mappings") or []
+    )
+    if (
+        len(mapping_by_estimation) > 1
+        and len(semantic_mappings) == len(order_lines)
+        and all(
+            not any(
+                str(value).strip()
+                for value in (line.get("estimate_number") or [])
+            )
+            and not any(
+                str(value).strip()
+                for value in (
+                    line.get("mapping_reference_number") or []
+                )
+            )
+            for line in order_lines
+        )
+    ):
+        ordered_estimation_keys: list[str] = []
+        for semantic_mapping in semantic_mappings:
+            estimation_number = normalize_estimation_number(
+                semantic_mapping.get("estimate_number")
+            )
+            if estimation_number is None:
+                ordered_estimation_keys = []
+                break
+            ordered_estimation_keys.append(str(estimation_number))
+        if (
+            len(ordered_estimation_keys) == len(order_lines)
+            and len(set(ordered_estimation_keys))
+            == len(ordered_estimation_keys)
+            and all(
+                key in mapping_by_estimation
+                for key in ordered_estimation_keys
+            )
+        ):
+            ordered_mapping_fallbacks = [
+                mapping_by_estimation[key]
+                for key in ordered_estimation_keys
+            ]
     reference_to_estimations: dict[str, set[str]] = {}
-    for semantic_mapping in result_data.get("estimation_mappings") or []:
+    for semantic_mapping in semantic_mappings:
         estimation_number = semantic_mapping.get("estimate_number")
         if estimation_number is None:
             continue
@@ -1824,6 +1891,7 @@ def build_extracted_po_document_detail_result(
         "mapping_reference_mapping_count": 0,
         "legacy_reference_mapping_count": 0,
         "single_parent_fallback_count": 0,
+        "ordered_mapping_fallback_count": 0,
     }
     for line_number, line in enumerate(order_lines, start=1):
         try:
@@ -1877,6 +1945,19 @@ def build_extracted_po_document_detail_result(
                     mapping = next(iter(mapping_by_estimation.values()))
                     association_counts[
                         "single_parent_fallback_count"
+                    ] += 1
+                elif (
+                    ordered_mapping_fallbacks is not None
+                ):
+                    # Some multi-PO layouts place the EST/LM mapping in a
+                    # separate ordered table and print no LM/EST association
+                    # inside the item rows. Use position only for a complete,
+                    # one-to-one sequence of unique, resolved mappings. A
+                    # populated but unresolved association-only reference is
+                    # treated as a conflict and remains review-required.
+                    mapping = ordered_mapping_fallbacks[line_number - 1]
+                    association_counts[
+                        "ordered_mapping_fallback_count"
                     ] += 1
                 else:
                     raise ValueError(

@@ -2153,6 +2153,7 @@ def insert_regular_order_document(
                 "mapping_reference_mapping_count": 0,
                 "legacy_reference_mapping_count": 0,
                 "single_parent_fallback_count": 0,
+                "ordered_mapping_fallback_count": 0,
             }
             if content_result is not None:
                 try:

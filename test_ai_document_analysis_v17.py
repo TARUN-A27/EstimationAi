@@ -64,7 +64,7 @@ def resolved_mappings(*pairs):
 
 
 class UnifiedAnalyzerNormalizationV17Tests(unittest.TestCase):
-    def test_primary_174651_wins_over_unrelated_174604(self):
+    def test_estimation_report_preserves_primary_and_all_table_values(self):
         result = normalize_content_understanding_result(
             v17_response(
                 "estimation",
@@ -74,9 +74,9 @@ class UnifiedAnalyzerNormalizationV17Tests(unittest.TestCase):
         )
         self.assertEqual(result["primary_estimation_number"], 174651)
         self.assertEqual(result["legacy_estimation_numbers"], [174604])
-        self.assertEqual(result["estimation_numbers"], [174651])
+        self.assertEqual(result["estimation_numbers"], [174651, 174604])
 
-    def test_primary_174693_ignores_legacy_and_table_values(self):
+    def test_estimation_report_preserves_line_estimation_values(self):
         result = normalize_content_understanding_result(
             v17_response(
                 "estimation",
@@ -85,7 +85,10 @@ class UnifiedAnalyzerNormalizationV17Tests(unittest.TestCase):
                 lines=[{"estimate_number": "174620"}],
             )
         )
-        self.assertEqual(result["estimation_numbers"], [174693])
+        self.assertEqual(
+            result["estimation_numbers"],
+            [174693, 174618, 174619, 174620],
+        )
         self.assertEqual(result["line_estimation_numbers"], [174620])
 
     def test_mixing_uses_primary_estimation_number(self):
@@ -101,13 +104,13 @@ class UnifiedAnalyzerNormalizationV17Tests(unittest.TestCase):
         self.assertEqual(result["estimation_numbers"], [])
         self.assertTrue(result["warnings"])
 
-    def test_invalid_present_primary_does_not_enable_legacy_fallback(self):
+    def test_invalid_primary_does_not_discard_valid_estimation_rows(self):
         result = normalize_content_understanding_result(
             v17_response("estimation", primary="not-an-est", legacy=["174651"])
         )
         self.assertTrue(result["primary_estimation_present"])
         self.assertIsNone(result["primary_estimation_number"])
-        self.assertEqual(result["estimation_numbers"], [])
+        self.assertEqual(result["estimation_numbers"], [174651])
 
     def test_po_estimation_mappings_parse_and_join_candidates(self):
         result = normalize_content_understanding_result(
