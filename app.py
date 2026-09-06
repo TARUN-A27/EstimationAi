@@ -29,6 +29,7 @@ from pending_reports import (
 from po_content_validation import (
     analyze_uploaded_document,
     build_extracted_po_document_detail_result,
+    fetch_certificate_master_entries,
 )
 from workflow_audit import WorkflowAuditStore
 from werkzeug.utils import secure_filename
@@ -2155,6 +2156,13 @@ def insert_regular_order_document(
                 "single_parent_fallback_count": 0,
                 "ordered_mapping_fallback_count": 0,
             }
+            certification_counts = {
+                "certification_present_count": 0,
+                "certification_master_match_count": 0,
+                "certification_missing_count": 0,
+                "certification_unmatched_count": 0,
+                "certification_ambiguous_count": 0,
+            }
             if content_result is not None:
                 try:
                     record_workflow_event(
@@ -2163,9 +2171,15 @@ def insert_regular_order_document(
                         "processing",
                         "Preparing extracted PO lines for storage",
                     )
+                    certificate_master_entries = (
+                        fetch_certificate_master_entries(cursor)
+                    )
                     detail_result = build_extracted_po_document_detail_result(
                         content_result,
                         estimation_order_mappings,
+                        certificate_master_entries=(
+                            certificate_master_entries
+                        ),
                     )
                     po_detail_rows = detail_result["rows"]
                     po_detail_rejections = detail_result[
@@ -2173,6 +2187,9 @@ def insert_regular_order_document(
                     ]
                     association_counts.update(
                         detail_result.get("association_counts") or {}
+                    )
+                    certification_counts.update(
+                        detail_result.get("certification_counts") or {}
                     )
                     if po_detail_rejections:
                         app.logger.warning(
@@ -2193,6 +2210,7 @@ def insert_regular_order_document(
                         "Prepared independently insertable PO detail lines",
                         {
                             **association_counts,
+                            **certification_counts,
                             "prepared_row_count": len(po_detail_rows),
                             "rejected_line_count": len(
                                 po_detail_rejections
@@ -2234,6 +2252,7 @@ def insert_regular_order_document(
                 "unmapped_estimation_count": len(rejected_estimations),
                 "excluded_parent_count": len(excluded_mappings),
                 **association_counts,
+                **certification_counts,
                 "detail_rows": po_detail_rows,
                 "detail_status": (
                     "REVIEW_REQUIRED"
@@ -2246,20 +2265,31 @@ def insert_regular_order_document(
                 "rejected_lines": po_detail_rejections,
                 "oracle_value_comparison": "SKIPPED",
                 "party_name_comparison": "SKIPPED",
-                "certificate_master_match": "SKIPPED",
+                "certificate_master_match": "ENFORCED",
             }
             app.logger.info(
-                "PO DETAILS PREPARED filename=%s analyzer_config=%s "
+                "PO DETAILS PREPARED filename=%s "
                 "prepared_row_count=%s rejected_line_count=%s "
                 "unmapped_estimation_count=%s excluded_parent_count=%s "
                 "oracle_detail_value_comparison=SKIPPED "
-                "party_comparison=SKIPPED certificate_master=SKIPPED",
+                "party_comparison=SKIPPED certificate_master=ENFORCED "
+                "certification_present_count=%s "
+                "certification_master_match_count=%s "
+                "certification_missing_count=%s "
+                "certification_unmatched_count=%s "
+                "certification_ambiguous_count=%s",
                 filename,
-                extraction_details["analyzer_configuration"],
                 len(po_detail_rows),
                 len(po_detail_rejections),
                 len(rejected_estimations),
                 len(excluded_mappings),
+                certification_counts["certification_present_count"],
+                certification_counts[
+                    "certification_master_match_count"
+                ],
+                certification_counts["certification_missing_count"],
+                certification_counts["certification_unmatched_count"],
+                certification_counts["certification_ambiguous_count"],
             )
 
             audit_detail_summary = {
@@ -2276,6 +2306,7 @@ def insert_regular_order_document(
                 "prepared_row_count": len(po_detail_rows),
                 "rejected_line_count": len(po_detail_rejections),
                 **association_counts,
+                **certification_counts,
             }
 
             if workflow is not None:
@@ -2983,6 +3014,7 @@ def insert_regular_order_document(
                         rejected_estimations
                     ),
                     "excluded_parent_count": len(excluded_mappings),
+                    **certification_counts,
                 },
             )
 

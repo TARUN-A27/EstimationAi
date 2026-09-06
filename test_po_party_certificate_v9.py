@@ -58,13 +58,14 @@ def result_with(*, party: str, certification: list[str]) -> dict:
 
 
 class PartyCertificateV9Tests(unittest.TestCase):
-    def test_exact_dotted_certificate_keeps_master_spelling(self) -> None:
+    def test_normalization_collision_requires_review(self) -> None:
         match = match_certificate_master_names(["B.C.T"], MASTER_NAMES)
-        self.assertEqual(match["stored_value"], "B.C.T")
+        self.assertEqual(match["status"], "ambiguous")
+        self.assertIsNone(match["stored_value"])
 
-    def test_exact_plain_certificate_remains_distinct(self) -> None:
-        match = match_certificate_master_names(["BCT"], MASTER_NAMES)
-        self.assertEqual(match["stored_value"], "BCT")
+    def test_single_canonical_normalized_name_is_selected(self) -> None:
+        match = match_certificate_master_names(["BCT"], ["B.C.T"])
+        self.assertEqual(match["stored_value"], "B.C.T")
 
     def test_longest_certificate_name_wins(self) -> None:
         match = match_certificate_master_names(
@@ -120,12 +121,12 @@ class PartyCertificateV9Tests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["party_name"], "UNRELATED COMPANY")
 
-    def test_production_no_longer_uses_legacy_matching_helpers(self) -> None:
+    def test_production_uses_only_certificate_master_matching(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
         self.assertNotIn("fetch_oracle_expected_rows", source)
         self.assertNotIn("validate_content_result", source)
         self.assertNotIn("fetch_expected_party_names", source)
-        self.assertNotIn("fetch_certificate_master_names", source)
+        self.assertIn("fetch_certificate_master_entries", source)
 
 
 if __name__ == "__main__":

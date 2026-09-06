@@ -36,11 +36,16 @@ class MappingCursor:
     def __init__(self, rows_by_estimation):
         self.rows_by_estimation = rows_by_estimation
         self.estimation_no = None
+        self.certificate_master_query = False
 
-    def execute(self, _query, **binds):
-        self.estimation_no = binds["estimation_no"]
+    def execute(self, query, **binds):
+        self.certificate_master_query = "PO_CERTTYPEMASTER" in query
+        if not self.certificate_master_query:
+            self.estimation_no = binds["estimation_no"]
 
     def fetchall(self):
+        if self.certificate_master_query:
+            return []
         return self.rows_by_estimation.get(self.estimation_no, [])
 
     def __enter__(self):

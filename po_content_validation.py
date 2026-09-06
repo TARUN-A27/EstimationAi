@@ -96,10 +96,8 @@ ORACLE_EXPECTED_PARTY_QUERY = """
 """
 
 CERTIFICATE_MASTER_QUERY = """
-    SELECT TRIM(NAME)
+    SELECT CODE, NAME
     FROM PO_CERTTYPEMASTER
-    WHERE NAME IS NOT NULL
-    ORDER BY NAME
 """
 
 
@@ -993,17 +991,26 @@ def fetch_expected_party_names(
     return result
 
 
-def fetch_certificate_master_names(cursor: Any) -> list[str]:
-    """Load canonical certificate names from PO_CERTTYPEMASTER.NAME."""
+def fetch_certificate_master_entries(
+    cursor: Any,
+) -> list[tuple[Any, str]]:
+    """Load certificate master rows on the caller's Oracle cursor."""
     cursor.execute(CERTIFICATE_MASTER_QUERY)
-    names = ordered_unique(
-        str(row[0]).strip()
+    return [
+        (row[0], str(row[1]).strip())
         for row in cursor.fetchall()
-        if row[0] is not None and str(row[0]).strip()
-    )
-    if not names:
-        raise ValueError("PO_CERTTYPEMASTER contains no certificate names")
-    return names
+        if len(row) >= 2
+        and row[1] is not None
+        and str(row[1]).strip()
+    ]
+
+
+def fetch_certificate_master_names(cursor: Any) -> list[str]:
+    """Compatibility helper returning only canonical certificate names."""
+    return [
+        name
+        for _code, name in fetch_certificate_master_entries(cursor)
+    ]
 
 
 def normalize_identifier(value: Any) -> str:
@@ -1163,94 +1170,100 @@ def compare_party_name(
 
 
 def match_certificate_master_names(
-    extracted_values: Iterable[Any],
+    extracted_values: Iterable[Any] | Any,
     master_names: Iterable[Any],
 ) -> dict[str, Any]:
-    """Match extracted certificate text to canonical master-table names.
+    """Resolve one canonical master NAME without exposing master CODE values.
 
-    Exact spelling is preferred so intentionally distinct master values such
-    as B.C.T/BCT and REGEN AGRI/REGENAGRI remain distinguishable. Longer
-    contained names win over shorter names such as OCS.
+    Matching uses uppercase alphanumeric copies of the inputs, leaving the
+    extracted values untouched. A master keyword may occur anywhere within an
+    extracted value. Duplicate identical canonical rows are collapsed, while
+    different canonical spellings with the same normalized keyword remain
+    ambiguous.
     """
-    extracted = ordered_unique(
-        str(value).strip()
-        for value in extracted_values
-        if str(value).strip()
-    )
-    masters = ordered_unique(
-        str(value).strip()
-        for value in master_names
-        if str(value).strip()
-    )
-    matches: list[str] = []
-    ambiguous: list[dict[str, Any]] = []
+    if extracted_values is None:
+        raw_values: list[Any] = []
+    elif isinstance(extracted_values, (str, bytes)):
+        raw_values = [extracted_values]
+    else:
+        raw_values = list(extracted_values)
 
-    for value in extracted:
-        raw_key = " ".join(value.upper().split())
-        exact = [
-            name
-            for name in masters
-            if " ".join(name.upper().split()) == raw_key
+    missing_keywords = {"NA", "NONE", "NULL", "NOTAPPLICABLE"}
+    genuine_values = [
+        value
+        for value in raw_values
+        if value is not None
+        and str(value).strip()
+        and identifier_key(value) not in missing_keywords
+    ]
+    if not genuine_values:
+        return {"status": "missing", "stored_value": None}
+
+    canonical_by_keyword: dict[str, list[str]] = {}
+    for value in master_names:
+        # Production passes (CODE, NAME); accepting bare names keeps this
+        # helper convenient for diagnostics and older callers. CODE is never
+        # retained in the matching structure or returned.
+        name_value = (
+            value[1]
+            if isinstance(value, (tuple, list)) and len(value) >= 2
+            else value
+        )
+        if name_value is None or not str(name_value).strip():
+            continue
+        canonical_name = str(name_value).strip()
+        keyword = identifier_key(canonical_name)
+        if not keyword:
+            continue
+        names = canonical_by_keyword.setdefault(keyword, [])
+        if canonical_name not in names:
+            names.append(canonical_name)
+
+    resolved_names: list[str] = []
+    unmatched = False
+    ambiguous = False
+    for extracted_value in genuine_values:
+        extracted_key = identifier_key(extracted_value)
+        matching_keywords = [
+            keyword
+            for keyword in canonical_by_keyword
+            if keyword in extracted_key
         ]
-        if len(exact) == 1:
-            matches.append(exact[0])
+        if not matching_keywords:
+            unmatched = True
             continue
 
-        literal = [
-            name
-            for name in masters
-            if name.upper() in value.upper()
+        longest_length = max(map(len, matching_keywords))
+        winning_keywords = [
+            keyword
+            for keyword in matching_keywords
+            if len(keyword) == longest_length
         ]
-        if literal:
-            longest = max(len(identifier_key(name)) for name in literal)
-            winners = [
-                name
-                for name in literal
-                if len(identifier_key(name)) == longest
-            ]
-            if len(winners) == 1:
-                matches.append(winners[0])
-                continue
+        if len(winning_keywords) != 1:
+            ambiguous = True
+            continue
 
-        extracted_key = identifier_key(value)
-        normalized = [
-            name
-            for name in masters
-            if identifier_key(name)
-            and identifier_key(name) in extracted_key
-        ]
-        if normalized:
-            longest = max(
-                len(identifier_key(name)) for name in normalized
-            )
-            winners = [
-                name
-                for name in normalized
-                if len(identifier_key(name)) == longest
-            ]
-            normalized_keys = {
-                identifier_key(name) for name in winners
-            }
-            if len(winners) == 1 and len(normalized_keys) == 1:
-                matches.append(winners[0])
-                continue
-            ambiguous.append(
-                {
-                    "extracted": value,
-                    "candidates": winners,
-                }
-            )
+        canonical_names = canonical_by_keyword[winning_keywords[0]]
+        if len(canonical_names) != 1:
+            ambiguous = True
+            continue
+        resolved_names.append(canonical_names[0])
 
-    canonical_matches = ordered_unique(matches)
+    # An unmatched genuine value is never discarded merely because another
+    # value matched. If all values matched individually but did not converge
+    # on one canonical NAME, the line is ambiguous.
+    if unmatched:
+        return {"status": "unmatched", "stored_value": None}
+    if ambiguous:
+        return {"status": "ambiguous", "stored_value": None}
+
+    distinct_names = ordered_unique(resolved_names)
+    if len(distinct_names) != 1:
+        return {"status": "ambiguous", "stored_value": None}
+
     return {
-        "extracted": extracted,
-        "matched_master_names": canonical_matches,
-        "ambiguous": ambiguous,
-        "stored_value": (
-            ", ".join(canonical_matches)
-            if canonical_matches
-            else None
-        ),
+        "status": "matched",
+        "stored_value": distinct_names[0],
     }
 
 
@@ -1722,18 +1735,22 @@ def build_po_document_detail_rows(
 def build_extracted_po_document_detail_result(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
+    *,
+    certificate_master_entries: Iterable[Any] | None = None,
 ) -> dict[str, Any]:
     """Build independently insertable PO lines from analyzer output.
 
     Oracle is used only to resolve the stamped estimation number to its
-    regular-order parent. No CostEstimation, YarnCount, PartyMaster, booking
-    rate, quantity, count, certification, reference, or party value is used.
+    regular-order parent and, when supplied, to canonicalize certification
+    against PO_CERTTYPEMASTER. No CostEstimation, YarnCount, PartyMaster,
+    booking rate, quantity, count, reference, or party value is compared.
 
     Missing extracted business fields are represented by ``None``. A line is
     rejected only when its parent cannot be resolved in a multi-EST document,
-    a numeric field contains more than one distinct value, or extracted text
-    cannot fit the target column. Rejection of one line never discards another
-    independently valid line.
+    its non-empty certification cannot be resolved uniquely, a numeric field
+    contains more than one distinct value, or extracted text cannot fit the
+    target column. Rejection of one line never discards another independently
+    valid line.
     """
 
     mappings: list[dict[str, Any]] = []
@@ -1893,8 +1910,66 @@ def build_extracted_po_document_detail_result(
         "single_parent_fallback_count": 0,
         "ordered_mapping_fallback_count": 0,
     }
+    certification_counts = {
+        "certification_present_count": 0,
+        "certification_master_match_count": 0,
+        "certification_missing_count": 0,
+        "certification_unmatched_count": 0,
+        "certification_ambiguous_count": 0,
+    }
+    certificate_master = (
+        list(certificate_master_entries)
+        if certificate_master_entries is not None
+        else None
+    )
     for line_number, line in enumerate(order_lines, start=1):
         try:
+            if certificate_master is None:
+                certification = joined_values(
+                    line.get("certification") or [],
+                    field_name=f"Certification on line {line_number}",
+                    maximum_length=300,
+                )
+            else:
+                certification = None
+                certificate_match = match_certificate_master_names(
+                    line.get("certification") or [],
+                    certificate_master,
+                )
+                certificate_status = certificate_match["status"]
+                if certificate_status == "missing":
+                    certification_counts[
+                        "certification_missing_count"
+                    ] += 1
+                else:
+                    certification_counts[
+                        "certification_present_count"
+                    ] += 1
+                    if certificate_status == "matched":
+                        certification_counts[
+                            "certification_master_match_count"
+                        ] += 1
+                        certification = certificate_match["stored_value"]
+                        if len(certification) > 300:
+                            raise ValueError(
+                                "Canonical certification exceeds the "
+                                "300-character database limit"
+                            )
+                    elif certificate_status == "unmatched":
+                        certification_counts[
+                            "certification_unmatched_count"
+                        ] += 1
+                        raise ValueError(
+                            "Certification has no master match"
+                        )
+                    else:
+                        certification_counts[
+                            "certification_ambiguous_count"
+                        ] += 1
+                        raise ValueError(
+                            "Certification master match is ambiguous"
+                        )
+
             raw_estimate_values = line.get("estimate_number") or []
             estimate_keys = extracted_estimation_keys(raw_estimate_values)
             if len(estimate_keys) > 1:
@@ -1990,11 +2065,7 @@ def build_extracted_po_document_detail_result(
                     field_name=f"Count on line {line_number}",
                     maximum_length=100,
                 ),
-                "certification": joined_values(
-                    line.get("certification") or [],
-                    field_name=f"Certification on line {line_number}",
-                    maximum_length=300,
-                ),
+                "certification": certification,
                 "net_rate": one_numeric_value(
                     line.get("confirm_rate") or [],
                     f"ConfirmRate on line {line_number}",
@@ -2013,16 +2084,20 @@ def build_extracted_po_document_detail_result(
         "rows": rows,
         "rejected_lines": rejected_lines,
         "association_counts": association_counts,
+        "certification_counts": certification_counts,
     }
 
 
 def build_extracted_po_document_detail_rows(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
+    *,
+    certificate_master_entries: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Compatibility wrapper returning only independently valid rows."""
 
     return build_extracted_po_document_detail_result(
         result_data,
         estimation_order_mappings,
+        certificate_master_entries=certificate_master_entries,
     )["rows"]
