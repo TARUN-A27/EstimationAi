@@ -121,9 +121,9 @@ class PartyCertificateV9Tests(unittest.TestCase):
         )
         self.assertEqual(rows[0]["party_name"], "UNRELATED COMPANY")
 
-    def test_production_uses_only_certificate_master_matching(self) -> None:
+    def test_production_uses_certificate_master_and_v32_oracle_matching(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
-        self.assertNotIn("fetch_oracle_expected_rows", source)
+        self.assertIn("fetch_oracle_expected_rows", source)
         self.assertNotIn("validate_content_result", source)
         self.assertNotIn("fetch_expected_party_names", source)
         self.assertIn("fetch_certificate_master_entries", source)

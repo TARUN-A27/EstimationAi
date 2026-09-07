@@ -29,7 +29,9 @@ from pending_reports import (
 from po_content_validation import (
     analyze_uploaded_document,
     build_extracted_po_document_detail_result,
+    empty_v32_field_validation_counts,
     fetch_certificate_master_entries,
+    fetch_oracle_expected_rows,
 )
 from workflow_audit import WorkflowAuditStore
 from werkzeug.utils import secure_filename
@@ -2163,6 +2165,9 @@ def insert_regular_order_document(
                 "certification_unmatched_count": 0,
                 "certification_ambiguous_count": 0,
             }
+            field_validation_counts = empty_v32_field_validation_counts()
+            field_validation_results = []
+            oracle_missing_estimations = []
             if content_result is not None:
                 try:
                     record_workflow_event(
@@ -2174,12 +2179,20 @@ def insert_regular_order_document(
                     certificate_master_entries = (
                         fetch_certificate_master_entries(cursor)
                     )
+                    (
+                        oracle_expected_rows,
+                        oracle_missing_estimations,
+                    ) = fetch_oracle_expected_rows(
+                        cursor,
+                        estimation_numbers,
+                    )
                     detail_result = build_extracted_po_document_detail_result(
                         content_result,
                         estimation_order_mappings,
                         certificate_master_entries=(
                             certificate_master_entries
                         ),
+                        oracle_expected_rows=oracle_expected_rows,
                     )
                     po_detail_rows = detail_result["rows"]
                     po_detail_rejections = detail_result[
@@ -2191,6 +2204,12 @@ def insert_regular_order_document(
                     certification_counts.update(
                         detail_result.get("certification_counts") or {}
                     )
+                    field_validation_counts.update(
+                        detail_result.get("field_validation_counts") or {}
+                    )
+                    field_validation_results = detail_result.get(
+                        "field_validation_results"
+                    ) or []
                     if po_detail_rejections:
                         app.logger.warning(
                             "PO DETAIL PARTIAL filename=%s "
@@ -2211,9 +2230,13 @@ def insert_regular_order_document(
                         {
                             **association_counts,
                             **certification_counts,
+                            **field_validation_counts,
                             "prepared_row_count": len(po_detail_rows),
                             "rejected_line_count": len(
                                 po_detail_rejections
+                            ),
+                            "oracle_missing_estimation_count": len(
+                                oracle_missing_estimations
                             ),
                         },
                     )
@@ -2253,7 +2276,9 @@ def insert_regular_order_document(
                 "excluded_parent_count": len(excluded_mappings),
                 **association_counts,
                 **certification_counts,
+                **field_validation_counts,
                 "detail_rows": po_detail_rows,
+                "field_validation_results": field_validation_results,
                 "detail_status": (
                     "REVIEW_REQUIRED"
                     if po_detail_error
@@ -2263,16 +2288,37 @@ def insert_regular_order_document(
                 ),
                 "detail_error": po_detail_error,
                 "rejected_lines": po_detail_rejections,
-                "oracle_value_comparison": "SKIPPED",
-                "party_name_comparison": "SKIPPED",
-                "certificate_master_match": "ENFORCED",
+                "oracle_missing_estimation_count": len(
+                    oracle_missing_estimations
+                ),
+                "oracle_value_comparison": "ENFORCED_PER_FIELD",
+                "party_name_comparison": "ENFORCED_PER_FIELD",
+                "certificate_master_match": "CANONICALIZE_THEN_VALIDATE",
+            }
+            field_status_totals = {
+                status: sum(
+                    count
+                    for key, count in field_validation_counts.items()
+                    if key.endswith(f"_{status}_count")
+                )
+                for status in (
+                    "match",
+                    "missing",
+                    "mismatch",
+                    "ambiguous",
+                    "invalid",
+                )
             }
             app.logger.info(
                 "PO DETAILS PREPARED filename=%s "
                 "prepared_row_count=%s rejected_line_count=%s "
                 "unmapped_estimation_count=%s excluded_parent_count=%s "
-                "oracle_detail_value_comparison=SKIPPED "
-                "party_comparison=SKIPPED certificate_master=ENFORCED "
+                "oracle_detail_value_comparison=ENFORCED_PER_FIELD "
+                "party_comparison=ENFORCED_PER_FIELD "
+                "certificate_master=CANONICALIZE_THEN_VALIDATE "
+                "field_match_count=%s field_missing_count=%s "
+                "field_mismatch_count=%s field_ambiguous_count=%s "
+                "field_invalid_count=%s "
                 "certification_present_count=%s "
                 "certification_master_match_count=%s "
                 "certification_missing_count=%s "
@@ -2283,6 +2329,11 @@ def insert_regular_order_document(
                 len(po_detail_rejections),
                 len(rejected_estimations),
                 len(excluded_mappings),
+                field_status_totals["match"],
+                field_status_totals["missing"],
+                field_status_totals["mismatch"],
+                field_status_totals["ambiguous"],
+                field_status_totals["invalid"],
                 certification_counts["certification_present_count"],
                 certification_counts[
                     "certification_master_match_count"
@@ -2307,6 +2358,10 @@ def insert_regular_order_document(
                 "rejected_line_count": len(po_detail_rejections),
                 **association_counts,
                 **certification_counts,
+                **field_validation_counts,
+                "oracle_missing_estimation_count": len(
+                    oracle_missing_estimations
+                ),
             }
 
             if workflow is not None:
@@ -2335,8 +2390,8 @@ def insert_regular_order_document(
                         workflow,
                         "validation",
                         "completed",
-                        "Extracted PO details prepared without "
-                        "business-value matching",
+                        "Extracted PO details prepared with per-field "
+                        "Oracle validation",
                         audit_detail_summary,
                     )
                 set_workflow_stage(
@@ -3015,6 +3070,7 @@ def insert_regular_order_document(
                     ),
                     "excluded_parent_count": len(excluded_mappings),
                     **certification_counts,
+                    **field_validation_counts,
                 },
             )
 

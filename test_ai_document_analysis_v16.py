@@ -37,14 +37,42 @@ class MappingCursor:
         self.rows_by_estimation = rows_by_estimation
         self.estimation_no = None
         self.certificate_master_query = False
+        self.expected_values_query = False
+        self.description = []
 
     def execute(self, query, **binds):
         self.certificate_master_query = "PO_CERTTYPEMASTER" in query
-        if not self.certificate_master_query:
+        self.expected_values_query = "GET_EST_CERT_TYPE" in query
+        if self.expected_values_query:
+            self.estimation_no = binds["est_no"]
+            self.description = [
+                ("ESTIMATION_NUMBER",),
+                ("REFERENCE_NUMBER",),
+                ("REQUIRED_QUANTITY",),
+                ("COUNT_NAME",),
+                ("PARTY_NAME",),
+                ("BOOKING_RATE",),
+                ("CERTIFICATION",),
+            ]
+        elif not self.certificate_master_query:
             self.estimation_no = binds["estimation_no"]
 
     def fetchall(self):
         if self.certificate_master_query:
+            return []
+        if self.expected_values_query:
+            if self.estimation_no in self.rows_by_estimation:
+                return [
+                    (
+                        self.estimation_no,
+                        None,
+                        None,
+                        "30S",
+                        None,
+                        None,
+                        None,
+                    )
+                ]
             return []
         return self.rows_by_estimation.get(self.estimation_no, [])
 

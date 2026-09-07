@@ -945,7 +945,10 @@ def fetch_oracle_expected_rows(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     missing: list[str] = []
-    for estimation_number in estimation_numbers:
+    unique_estimation_numbers = list(
+        dict.fromkeys(int(value) for value in estimation_numbers)
+    )
+    for estimation_number in unique_estimation_numbers:
         cursor.execute(
             ORACLE_EXPECTED_VALUES_QUERY,
             est_no=int(estimation_number),
@@ -1274,6 +1277,326 @@ def normalize_numeric(value: Any) -> str:
     if parsed == 0:
         return "0"
     return format(parsed.normalize(), "f")
+
+
+V32_FIELD_NAMES = (
+    "party_name",
+    "reference_number",
+    "required_quantity",
+    "count",
+    "confirm_rate",
+    "certification",
+)
+V32_FIELD_STATUSES = (
+    "MATCH",
+    "MISSING",
+    "MISMATCH",
+    "AMBIGUOUS",
+    "INVALID",
+)
+
+
+def empty_v32_field_validation_counts() -> dict[str, int]:
+    """Return value-free counters suitable for workflow auditing."""
+    return {
+        f"oracle_{field_name}_{status.lower()}_count": 0
+        for field_name in V32_FIELD_NAMES
+        for status in V32_FIELD_STATUSES
+    }
+
+
+def _as_field_values(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes, Decimal, int, float)):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _v32_text_candidate(
+    values: Any,
+    *,
+    normalizer: Any,
+    maximum_length: int,
+) -> dict[str, Any]:
+    extracted = [
+        str(value).strip()
+        for value in _as_field_values(values)
+        if value is not None and str(value).strip()
+    ]
+    if not extracted:
+        return {"status": "MISSING", "stored_value": None}
+
+    normalized_values: list[str] = []
+    for value in extracted:
+        normalized = normalizer(value)
+        if not normalized:
+            return {"status": "INVALID", "stored_value": None}
+        normalized_values.append(normalized)
+    distinct = ordered_unique(normalized_values)
+    if len(distinct) != 1:
+        return {"status": "AMBIGUOUS", "stored_value": None}
+    stored_value = extracted[0]
+    if len(stored_value) > maximum_length:
+        return {"status": "INVALID", "stored_value": None}
+    return {
+        "status": None,
+        "stored_value": stored_value,
+        "comparison_value": distinct[0],
+    }
+
+
+def _v32_decimal(value: Any) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    numeric_pattern = (
+        r"[-+]?(?:"
+        r"\d+(?:\.\d+)?"
+        r"|\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+        r"|\d{1,2}(?:,\d{2})*,\d{3}(?:\.\d+)?"
+        r"|\.\d+"
+        r")"
+    )
+    if re.fullmatch(numeric_pattern, text) is None:
+        return None
+    try:
+        return Decimal(text.replace(",", ""))
+    except InvalidOperation:
+        return None
+
+
+def _v32_numeric_candidate(values: Any) -> dict[str, Any]:
+    extracted = [
+        value
+        for value in _as_field_values(values)
+        if value is not None and str(value).strip()
+    ]
+    if not extracted:
+        return {"status": "MISSING", "stored_value": None}
+    parsed = [_v32_decimal(value) for value in extracted]
+    if any(value is None for value in parsed):
+        return {"status": "INVALID", "stored_value": None}
+    distinct = list(dict.fromkeys(parsed))
+    if len(distinct) != 1:
+        return {"status": "AMBIGUOUS", "stored_value": None}
+    value = distinct[0]
+    return {
+        "status": None,
+        "stored_value": format(value, "f"),
+        "comparison_value": value,
+    }
+
+
+def _v32_certification_candidate(
+    certificate_match: Mapping[str, Any],
+) -> dict[str, Any]:
+    status = certificate_match.get("status")
+    if status == "missing":
+        return {"status": "MISSING", "stored_value": None}
+    if status == "ambiguous":
+        return {"status": "AMBIGUOUS", "stored_value": None}
+    if status != "matched":
+        return {"status": "INVALID", "stored_value": None}
+    canonical_name = str(
+        certificate_match.get("stored_value") or ""
+    ).strip()
+    if not canonical_name or len(canonical_name) > 300:
+        return {"status": "INVALID", "stored_value": None}
+    comparison_value = normalize_identifier(canonical_name)
+    if not comparison_value:
+        return {"status": "INVALID", "stored_value": None}
+    return {
+        "status": None,
+        "stored_value": canonical_name,
+        "comparison_value": comparison_value,
+    }
+
+
+def _v32_expected_comparison_value(
+    field_name: str,
+    expected_value: Any,
+) -> Any:
+    if field_name in {"required_quantity", "confirm_rate"}:
+        return _v32_decimal(expected_value)
+    normalizers = {
+        "party_name": normalize_party_name,
+        "reference_number": normalize_reference_number,
+        "count": normalize_identifier,
+        "certification": normalize_identifier,
+    }
+    if expected_value is None or not str(expected_value).strip():
+        return ""
+    return normalizers[field_name](expected_value)
+
+
+def _v32_candidate_matches(
+    extracted_fields: Mapping[str, Mapping[str, Any]],
+    oracle_row: Mapping[str, Any],
+) -> dict[str, bool]:
+    oracle_keys = {
+        "party_name": "party_name",
+        "reference_number": "reference_number",
+        "required_quantity": "required_quantity",
+        "count": "count_name",
+        "confirm_rate": "booking_rate",
+        "certification": "certification",
+    }
+    matches: dict[str, bool] = {}
+    for field_name, expected_key in oracle_keys.items():
+        candidate = extracted_fields[field_name]
+        if candidate.get("status") is not None:
+            matches[field_name] = False
+            continue
+        expected = _v32_expected_comparison_value(
+            field_name,
+            oracle_row.get(expected_key),
+        )
+        matches[field_name] = bool(
+            expected != ""
+            and expected is not None
+            and candidate.get("comparison_value") == expected
+        )
+    return matches
+
+
+def _v32_validate_business_fields(
+    line: Mapping[str, Any],
+    document_party_names: Iterable[Any],
+    certificate_match: Mapping[str, Any],
+    oracle_candidates: list[tuple[int, Mapping[str, Any]]],
+    used_oracle_row_indexes: set[int],
+) -> dict[str, Any]:
+    """Validate one structurally-associated line field by field.
+
+    The returned ``stored_values`` contains no Oracle replacement values. An
+    Oracle row is used only as equality evidence, and only a MATCH status can
+    retain an extracted value (or the V31 canonical certification NAME).
+    """
+    line_party_values = [
+        value
+        for value in _as_field_values(line.get("party_name"))
+        if value is not None and str(value).strip()
+    ]
+    party_values = (
+        line_party_values
+        if line_party_values
+        else list(document_party_names)
+    )
+    extracted_fields = {
+        "party_name": _v32_text_candidate(
+            party_values,
+            normalizer=normalize_party_name,
+            maximum_length=300,
+        ),
+        "reference_number": _v32_text_candidate(
+            line.get("reference_number"),
+            normalizer=normalize_reference_number,
+            maximum_length=100,
+        ),
+        "required_quantity": _v32_numeric_candidate(
+            line.get("required_quantity")
+        ),
+        "count": _v32_text_candidate(
+            line.get("count"),
+            normalizer=normalize_identifier,
+            maximum_length=100,
+        ),
+        "confirm_rate": _v32_numeric_candidate(line.get("confirm_rate")),
+        "certification": _v32_certification_candidate(certificate_match),
+    }
+
+    weights = {
+        "party_name": 2,
+        "reference_number": 4,
+        "required_quantity": 3,
+        "count": 2,
+        "confirm_rate": 2,
+        "certification": 1,
+    }
+    ranked: list[
+        tuple[int, int, int, Mapping[str, Any], dict[str, bool]]
+    ] = []
+    for row_index, oracle_row in oracle_candidates:
+        matches = _v32_candidate_matches(extracted_fields, oracle_row)
+        evidence_count = sum(matches.values())
+        if evidence_count:
+            ranked.append(
+                (
+                    sum(
+                        weights[field_name]
+                        for field_name, matched in matches.items()
+                        if matched
+                    ),
+                    evidence_count,
+                    row_index,
+                    oracle_row,
+                    matches,
+                )
+            )
+
+    selected: tuple[
+        int,
+        int,
+        int,
+        Mapping[str, Any],
+        dict[str, bool],
+    ] | None = None
+    if not oracle_candidates:
+        row_status = "NOT_FOUND"
+    elif not ranked:
+        row_status = "UNSUPPORTED"
+    else:
+        best_rank = max((item[0], item[1]) for item in ranked)
+        equally_best = [
+            item for item in ranked if (item[0], item[1]) == best_rank
+        ]
+        if len(equally_best) == 1:
+            if equally_best[0][2] in used_oracle_row_indexes:
+                row_status = "ALREADY_ASSIGNED"
+            else:
+                selected = equally_best[0]
+                row_status = "MATCH"
+        else:
+            row_status = "AMBIGUOUS"
+
+    statuses: dict[str, str] = {}
+    stored_values: dict[str, Any] = {}
+    selected_matches = selected[4] if selected is not None else {}
+    for field_name, candidate in extracted_fields.items():
+        preliminary_status = candidate.get("status")
+        if preliminary_status is not None:
+            final_status = preliminary_status
+        elif selected is not None:
+            final_status = (
+                "MATCH" if selected_matches[field_name] else "MISMATCH"
+            )
+        elif row_status == "UNSUPPORTED" and len(oracle_candidates) == 1:
+            final_status = "MISMATCH"
+        elif row_status == "AMBIGUOUS" or oracle_candidates:
+            final_status = "AMBIGUOUS"
+        else:
+            final_status = "INVALID"
+        statuses[field_name] = final_status
+        stored_values[field_name] = (
+            candidate.get("stored_value")
+            if final_status == "MATCH"
+            else None
+        )
+
+    return {
+        "oracle_row_status": row_status,
+        "selected_oracle_row_index": (
+            selected[2] if selected is not None else None
+        ),
+        "field_statuses": statuses,
+        "stored_values": stored_values,
+    }
 
 
 def compare_expected_value(
@@ -1737,20 +2060,14 @@ def build_extracted_po_document_detail_result(
     estimation_order_mappings: Iterable[Mapping[str, Any]],
     *,
     certificate_master_entries: Iterable[Any] | None = None,
+    oracle_expected_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build independently insertable PO lines from analyzer output.
 
-    Oracle is used only to resolve the stamped estimation number to its
-    regular-order parent and, when supplied, to canonicalize certification
-    against PO_CERTTYPEMASTER. No CostEstimation, YarnCount, PartyMaster,
-    booking rate, quantity, count, reference, or party value is compared.
-
-    Missing extracted business fields are represented by ``None``. A line is
-    rejected only when its parent cannot be resolved in a multi-EST document,
-    its non-empty certification cannot be resolved uniquely, a numeric field
-    contains more than one distinct value, or extracted text cannot fit the
-    target column. Rejection of one line never discards another independently
-    valid line.
+    When ``oracle_expected_rows`` is supplied, V32 validates every optional
+    business field independently. Missing, invalid, ambiguous, or mismatching
+    fields become ``None`` without rejecting a structurally-associated line.
+    The legacy no-Oracle mode remains available to diagnostic callers.
     """
 
     mappings: list[dict[str, Any]] = []
@@ -1895,10 +2212,14 @@ def build_extracted_po_document_detail_result(
                 keys.add(str(number))
         return keys
 
-    document_party_name = joined_values(
-        party_names,
-        field_name="PartyName",
-        maximum_length=300,
+    document_party_name = (
+        None
+        if oracle_expected_rows is not None
+        else joined_values(
+            party_names,
+            field_name="PartyName",
+            maximum_length=300,
+        )
     )
 
     rows: list[dict[str, Any]] = []
@@ -1922,19 +2243,51 @@ def build_extracted_po_document_detail_result(
         if certificate_master_entries is not None
         else None
     )
+    v32_enabled = oracle_expected_rows is not None
+    oracle_rows_by_estimation: dict[
+        str,
+        list[tuple[int, Mapping[str, Any]]],
+    ] = {}
+    for oracle_row_index, raw_oracle_row in enumerate(
+        oracle_expected_rows or [],
+        start=1,
+    ):
+        oracle_row = {
+            str(key).lower(): value
+            for key, value in raw_oracle_row.items()
+        }
+        estimation_number = normalize_estimation_number(
+            oracle_row.get("estimation_number")
+        )
+        if estimation_number is None:
+            continue
+        oracle_rows_by_estimation.setdefault(
+            str(estimation_number),
+            [],
+        ).append((oracle_row_index, oracle_row))
+    used_oracle_row_indexes: set[int] = set()
+    field_validation_results: list[dict[str, Any]] = []
+    field_validation_counts = empty_v32_field_validation_counts()
     for line_number, line in enumerate(order_lines, start=1):
         try:
-            if certificate_master is None:
+            certificate_match: dict[str, Any]
+            if certificate_master is None and not v32_enabled:
                 certification = joined_values(
                     line.get("certification") or [],
                     field_name=f"Certification on line {line_number}",
                     maximum_length=300,
                 )
+                certificate_match = {
+                    "status": (
+                        "missing" if certification is None else "matched"
+                    ),
+                    "stored_value": certification,
+                }
             else:
                 certification = None
                 certificate_match = match_certificate_master_names(
                     line.get("certification") or [],
-                    certificate_master,
+                    certificate_master or [],
                 )
                 certificate_status = certificate_match["status"]
                 if certificate_status == "missing":
@@ -1950,7 +2303,7 @@ def build_extracted_po_document_detail_result(
                             "certification_master_match_count"
                         ] += 1
                         certification = certificate_match["stored_value"]
-                        if len(certification) > 300:
+                        if len(certification) > 300 and not v32_enabled:
                             raise ValueError(
                                 "Canonical certification exceeds the "
                                 "300-character database limit"
@@ -1959,16 +2312,18 @@ def build_extracted_po_document_detail_result(
                         certification_counts[
                             "certification_unmatched_count"
                         ] += 1
-                        raise ValueError(
-                            "Certification has no master match"
-                        )
+                        if not v32_enabled:
+                            raise ValueError(
+                                "Certification has no master match"
+                            )
                     else:
                         certification_counts[
                             "certification_ambiguous_count"
                         ] += 1
-                        raise ValueError(
-                            "Certification master match is ambiguous"
-                        )
+                        if not v32_enabled:
+                            raise ValueError(
+                                "Certification master match is ambiguous"
+                            )
 
             raw_estimate_values = line.get("estimate_number") or []
             estimate_keys = extracted_estimation_keys(raw_estimate_values)
@@ -2041,36 +2396,82 @@ def build_extracted_po_document_detail_result(
                         f"or {association_field}"
                     )
 
-            detail_row = {
-                "estimation_number": int(mapping["estimation_number"]),
-                "regular_order_number": mapping[
-                    "regular_order_number"
-                ],
-                "party_name": joined_values(
-                    line.get("party_name") or [],
-                    field_name=f"PartyName on line {line_number}",
-                    maximum_length=300,
-                ) or document_party_name,
-                "reference_number": joined_values(
-                    line.get("reference_number") or [],
-                    field_name=f"ReferenceNumber on line {line_number}",
-                    maximum_length=100,
-                ),
-                "required_quantity": one_numeric_value(
-                    line.get("required_quantity") or [],
-                    f"RequiredQuantity on line {line_number}",
-                ),
-                "count_name": joined_values(
-                    line.get("count") or [],
-                    field_name=f"Count on line {line_number}",
-                    maximum_length=100,
-                ),
-                "certification": certification,
-                "net_rate": one_numeric_value(
-                    line.get("confirm_rate") or [],
-                    f"ConfirmRate on line {line_number}",
-                ),
-            }
+            estimation_key = mapping["estimation_number"]
+            if v32_enabled:
+                oracle_candidates = (
+                    oracle_rows_by_estimation.get(estimation_key) or []
+                )
+                validation = _v32_validate_business_fields(
+                    line,
+                    party_names,
+                    certificate_match,
+                    oracle_candidates,
+                    used_oracle_row_indexes,
+                )
+                selected_row_index = validation[
+                    "selected_oracle_row_index"
+                ]
+                if selected_row_index is not None:
+                    used_oracle_row_indexes.add(selected_row_index)
+                field_statuses = validation["field_statuses"]
+                for field_name, status in field_statuses.items():
+                    field_validation_counts[
+                        f"oracle_{field_name}_{status.lower()}_count"
+                    ] += 1
+                field_validation_results.append(
+                    {
+                        "source_line_number": line_number,
+                        "estimation_number": int(estimation_key),
+                        "oracle_row_status": validation[
+                            "oracle_row_status"
+                        ],
+                        "fields": dict(field_statuses),
+                    }
+                )
+                stored = validation["stored_values"]
+                detail_row = {
+                    "estimation_number": int(estimation_key),
+                    "regular_order_number": mapping[
+                        "regular_order_number"
+                    ],
+                    "party_name": stored["party_name"],
+                    "reference_number": stored["reference_number"],
+                    "required_quantity": stored["required_quantity"],
+                    "count_name": stored["count"],
+                    "certification": stored["certification"],
+                    "net_rate": stored["confirm_rate"],
+                }
+            else:
+                detail_row = {
+                    "estimation_number": int(estimation_key),
+                    "regular_order_number": mapping[
+                        "regular_order_number"
+                    ],
+                    "party_name": joined_values(
+                        line.get("party_name") or [],
+                        field_name=f"PartyName on line {line_number}",
+                        maximum_length=300,
+                    ) or document_party_name,
+                    "reference_number": joined_values(
+                        line.get("reference_number") or [],
+                        field_name=f"ReferenceNumber on line {line_number}",
+                        maximum_length=100,
+                    ),
+                    "required_quantity": one_numeric_value(
+                        line.get("required_quantity") or [],
+                        f"RequiredQuantity on line {line_number}",
+                    ),
+                    "count_name": joined_values(
+                        line.get("count") or [],
+                        field_name=f"Count on line {line_number}",
+                        maximum_length=100,
+                    ),
+                    "certification": certification,
+                    "net_rate": one_numeric_value(
+                        line.get("confirm_rate") or [],
+                        f"ConfirmRate on line {line_number}",
+                    ),
+                }
             rows.append(detail_row)
         except ValueError as exc:
             rejected_lines.append(
@@ -2085,6 +2486,8 @@ def build_extracted_po_document_detail_result(
         "rejected_lines": rejected_lines,
         "association_counts": association_counts,
         "certification_counts": certification_counts,
+        "field_validation_results": field_validation_results,
+        "field_validation_counts": field_validation_counts,
     }
 
 
@@ -2093,6 +2496,7 @@ def build_extracted_po_document_detail_rows(
     estimation_order_mappings: Iterable[Mapping[str, Any]],
     *,
     certificate_master_entries: Iterable[Any] | None = None,
+    oracle_expected_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Compatibility wrapper returning only independently valid rows."""
 
@@ -2100,4 +2504,5 @@ def build_extracted_po_document_detail_rows(
         result_data,
         estimation_order_mappings,
         certificate_master_entries=certificate_master_entries,
+        oracle_expected_rows=oracle_expected_rows,
     )["rows"]

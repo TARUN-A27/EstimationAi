@@ -209,7 +209,7 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
             detail_result["rejected_lines"][0]["reason"],
         )
 
-    def test_production_insert_omits_removed_columns_and_comparison(self) -> None:
+    def test_production_insert_omits_removed_columns_and_uses_v32_comparison(self) -> None:
         source = (PROJECT_DIR / "app.py").read_text(encoding="utf-8")
         detail_insert = source.split(
             "INSERT INTO REGULARORDER_PODOCUMENTDETAILS (", 1
@@ -218,7 +218,10 @@ class ExtractedPoDetailsV8Tests(unittest.TestCase):
         self.assertNotIn("DOCUMENTTYPE", detail_insert)
         self.assertNotIn("validate_content_result", source)
         self.assertIn("build_extracted_po_document_detail_result", source)
-        self.assertIn('"oracle_value_comparison": "SKIPPED"', source)
+        self.assertIn(
+            '"oracle_value_comparison": "ENFORCED_PER_FIELD"',
+            source,
+        )
 
     def test_v8_migration_drops_only_obsolete_columns(self) -> None:
         source = (PROJECT_DIR / "migrate_po_details_v8.py").read_text(

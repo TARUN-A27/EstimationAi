@@ -54,7 +54,7 @@ class PoDetailsNoMatchingV11Tests(unittest.TestCase):
         self.assertNotIn("party_match", rows[0])
         self.assertNotIn("certificate_match", rows[0])
 
-    def test_production_builder_receives_only_certificate_master_data(self) -> None:
+    def test_production_builder_receives_v31_master_and_v32_oracle_rows(self) -> None:
         source = APP_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         insert_function = next(
@@ -75,16 +75,26 @@ class PoDetailsNoMatchingV11Tests(unittest.TestCase):
         self.assertEqual(len(calls[0].args), 2)
         self.assertEqual(
             [keyword.arg for keyword in calls[0].keywords],
-            ["certificate_master_entries"],
+            ["certificate_master_entries", "oracle_expected_rows"],
         )
         self.assertNotIn("fetch_expected_party_names", source)
         self.assertIn("fetch_certificate_master_entries", source)
+        self.assertIn("fetch_oracle_expected_rows", source)
 
-    def test_workflow_reports_only_certificate_matching_as_enforced(self) -> None:
+    def test_workflow_reports_v32_field_matching_as_enforced(self) -> None:
         source = APP_PATH.read_text(encoding="utf-8")
-        self.assertIn('"oracle_value_comparison": "SKIPPED"', source)
-        self.assertIn('"party_name_comparison": "SKIPPED"', source)
-        self.assertIn('"certificate_master_match": "ENFORCED"', source)
+        self.assertIn(
+            '"oracle_value_comparison": "ENFORCED_PER_FIELD"',
+            source,
+        )
+        self.assertIn(
+            '"party_name_comparison": "ENFORCED_PER_FIELD"',
+            source,
+        )
+        self.assertIn(
+            '"certificate_master_match": "CANONICALIZE_THEN_VALIDATE"',
+            source,
+        )
 
     def test_detail_replacement_and_insert_sql_remain_unchanged(self) -> None:
         source = APP_PATH.read_text(encoding="utf-8")
