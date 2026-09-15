@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv(EnvPath(__file__).resolve().with_name(".env"))
 
 import os
+import hashlib
 import re
 import time
 import uuid
@@ -32,6 +33,7 @@ from po_content_validation import (
     empty_v32_field_validation_counts,
     fetch_certificate_master_entries,
     fetch_oracle_expected_rows,
+    identifier_key,
 )
 from workflow_audit import WorkflowAuditStore
 from werkzeug.utils import secure_filename
@@ -257,6 +259,15 @@ def get_azure_client() -> ComputerVisionClient:
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def content_sha256(file_path: Path) -> str:
+    """Return a request-scoped content identity without logging document data."""
+    digest = hashlib.sha256()
+    with Path(file_path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def unique(values):
@@ -1411,6 +1422,7 @@ def resolve_po_estimation_candidates(
     *,
     expected_est_no: int | None = None,
     expected_order_no: str | None = None,
+    estimation_mappings: list[dict] | None = None,
 ) -> dict:
     """Resolve each AI EST independently without deriving new identities."""
     document_numbers = unique(
@@ -1418,6 +1430,21 @@ def resolve_po_estimation_candidates(
     )
     line_numbers = unique(int(value) for value in line_estimation_numbers)
     candidates = unique([*document_numbers, *line_numbers])
+    semantic_references_by_estimation = {}
+    for semantic_mapping in estimation_mappings or []:
+        try:
+            estimation_no = int(semantic_mapping.get("estimate_number"))
+        except (TypeError, ValueError):
+            continue
+        reference_keys = {
+            identifier_key(reference)
+            for reference in semantic_mapping.get("reference_numbers") or []
+            if identifier_key(reference)
+        }
+        if reference_keys:
+            semantic_references_by_estimation.setdefault(
+                estimation_no, set()
+            ).update(reference_keys)
 
     if expected_est_no is not None and int(expected_est_no) not in document_numbers:
         raise DocumentValidationError(
@@ -1468,29 +1495,50 @@ def resolve_po_estimation_candidates(
             continue
 
         order_no = order_numbers[0]
+        reference_order_numbers = sorted(
+            {
+                reference
+                for regular, reference in rows
+                if regular == order_no and reference
+            }
+        )
+        semantic_reference_keys = semantic_references_by_estimation.get(
+            estimation_no, set()
+        )
+        resolved_order_keys = {
+            identifier_key(order_no),
+            *(identifier_key(value) for value in reference_order_numbers),
+        }
+        if (
+            expected_order_no is not None
+            and semantic_reference_keys
+            and not semantic_reference_keys.issubset(resolved_order_keys)
+        ):
+            rejected_estimations.append(
+                {
+                    "estimation_no": estimation_no,
+                    "source": "semantic_mapping",
+                    "reason": "SEMANTIC_ORDER_CONFLICT",
+                }
+            )
+            continue
         mapped.append(
             {
                 "estimation_no": estimation_no,
                 "regular_order_number": order_no,
-                "reference_order_numbers": sorted(
-                    {
-                        reference
-                        for regular, reference in rows
-                        if regular == order_no and reference
-                    }
-                ),
+                "reference_order_numbers": reference_order_numbers,
             }
         )
 
     excluded_mappings = []
     if expected_order_no:
-        expected_key = str(expected_order_no).strip().upper()
+        expected_key = identifier_key(expected_order_no)
 
         def is_selected(mapping):
             return expected_key in {
-                mapping["regular_order_number"].upper(),
+                identifier_key(mapping["regular_order_number"]),
                 *(
-                    value.upper()
+                    identifier_key(value)
                     for value in mapping["reference_order_numbers"]
                 ),
             }
@@ -1525,12 +1573,17 @@ def resolve_po_estimation_candidates(
 
     return {
         "mappings": retained,
+        "original_mappings": mapped,
         "order_numbers": unique(
             mapping["regular_order_number"] for mapping in retained
         ),
         "rejected_estimations": rejected_estimations,
         "excluded_mappings": excluded_mappings,
         "candidate_count": len(candidates),
+        "mapping_conflict_count": sum(
+            item.get("reason") == "SEMANTIC_ORDER_CONFLICT"
+            for item in rejected_estimations
+        ),
     }
 
 
@@ -2067,6 +2120,28 @@ def insert_regular_order_document(
             },
         )
 
+    normalization_mapping_conflicts = int(
+        content_result.get("mapping_conflict_count") or 0
+    )
+    if normalization_mapping_conflicts:
+        message = (
+            "The document contains incomplete or conflicting EST-to-order "
+            "mapping evidence and requires review. Nothing was inserted"
+        )
+        if workflow is not None:
+            set_workflow_stage(
+                workflow,
+                "validation",
+                "review_required",
+                message,
+                {
+                    "mapping_conflict_count": (
+                        normalization_mapping_conflicts
+                    )
+                },
+            )
+        raise DocumentValidationError(message)
+
     record_workflow_event(
         workflow,
         "oracle_connection",
@@ -2113,8 +2188,14 @@ def insert_regular_order_document(
                 line_estimation_numbers,
                 expected_est_no=expected_est_no,
                 expected_order_no=expected_order_no,
+                estimation_mappings=content_result.get(
+                    "estimation_mappings"
+                ) or [],
             )
             estimation_order_mappings = resolution["mappings"]
+            original_estimation_order_mappings = resolution[
+                "original_mappings"
+            ]
             order_numbers = resolution["order_numbers"]
             rejected_estimations = resolution["rejected_estimations"]
             excluded_mappings = resolution["excluded_mappings"]
@@ -2189,6 +2270,9 @@ def insert_regular_order_document(
                     detail_result = build_extracted_po_document_detail_result(
                         content_result,
                         estimation_order_mappings,
+                        original_estimation_order_mappings=(
+                            original_estimation_order_mappings
+                        ),
                         certificate_master_entries=(
                             certificate_master_entries
                         ),
@@ -2274,6 +2358,29 @@ def insert_regular_order_document(
                 "regular_order_numbers": order_numbers,
                 "unmapped_estimation_count": len(rejected_estimations),
                 "excluded_parent_count": len(excluded_mappings),
+                "semantic_mapping_count": int(
+                    content_result.get("semantic_mapping_count") or 0
+                ),
+                "fallback_mapping_count": int(
+                    content_result.get("fallback_mapping_count") or 0
+                ),
+                "mapping_table_detected_count": int(
+                    content_result.get("mapping_table_detected_count") or 0
+                ),
+                "mapping_fallback_used_count": int(
+                    content_result.get("mapping_fallback_used_count") or 0
+                ),
+                "mapping_conflict_count": (
+                    normalization_mapping_conflicts
+                    + int(resolution.get("mapping_conflict_count") or 0)
+                ),
+                "supporting_page_ignored_count": int(
+                    content_result.get("supporting_page_ignored_count") or 0
+                ),
+                "original_document_mapping_count": int(
+                    content_result.get("original_document_mapping_count") or 0
+                ),
+                "retained_mapping_count": len(estimation_order_mappings),
                 **association_counts,
                 **certification_counts,
                 **field_validation_counts,
@@ -2354,6 +2461,30 @@ def insert_regular_order_document(
                 "regular_order_count": len(order_numbers),
                 "unmapped_estimation_count": len(rejected_estimations),
                 "excluded_parent_count": len(excluded_mappings),
+                "semantic_mapping_count": extraction_details[
+                    "semantic_mapping_count"
+                ],
+                "fallback_mapping_count": extraction_details[
+                    "fallback_mapping_count"
+                ],
+                "mapping_table_detected_count": extraction_details[
+                    "mapping_table_detected_count"
+                ],
+                "mapping_fallback_used_count": extraction_details[
+                    "mapping_fallback_used_count"
+                ],
+                "mapping_conflict_count": extraction_details[
+                    "mapping_conflict_count"
+                ],
+                "supporting_page_ignored_count": extraction_details[
+                    "supporting_page_ignored_count"
+                ],
+                "original_document_mapping_count": extraction_details[
+                    "original_document_mapping_count"
+                ],
+                "retained_mapping_count": extraction_details[
+                    "retained_mapping_count"
+                ],
                 "prepared_row_count": len(po_detail_rows),
                 "rejected_line_count": len(po_detail_rejections),
                 **association_counts,
@@ -3240,6 +3371,7 @@ def upload_files():
     results = []
     errors = []
     skipped = []
+    successful_content_digests = set()
 
     try:
         for uploaded_file in uploaded_files:
@@ -3352,6 +3484,55 @@ def upload_files():
                 "completed",
                 "PDF received by the server",
                 {"file_size_bytes": temporary_path.stat().st_size},
+            )
+
+            document_content_digest = content_sha256(temporary_path)
+            if document_content_digest in successful_content_digests:
+                duplicate_message = (
+                    "Identical PDF content was already processed in this "
+                    "upload batch"
+                )
+                record_workflow_event(
+                    workflow,
+                    "duplicate_content_check",
+                    "skipped",
+                    duplicate_message,
+                    {"duplicate_content_detected_count": 1},
+                )
+                set_workflow_stage(
+                    workflow,
+                    "ocr",
+                    "skipped",
+                    duplicate_message,
+                )
+                block_pending_workflow_stages(
+                    workflow,
+                    "Not required for duplicate content in this batch",
+                )
+                skipped.append({
+                    "filename": filename,
+                    "error": duplicate_message,
+                    "duplicate_content_detected_count": 1,
+                    "workflow": workflow,
+                    "workflow_id": workflow_id,
+                })
+                record_workflow_event(
+                    workflow,
+                    "workflow_complete",
+                    "skipped",
+                    duplicate_message,
+                    {
+                        "duplicate_content_detected_count": 1,
+                        "duration_ms": workflow_duration_ms(workflow),
+                    },
+                )
+                continue
+            record_workflow_event(
+                workflow,
+                "duplicate_content_check",
+                "completed",
+                "No earlier successful file in this batch has identical content",
+                {"duplicate_content_detected_count": 0},
             )
 
             try:
@@ -3510,6 +3691,7 @@ def upload_files():
                             },
                         )
 
+                inserted.setdefault("duplicate_content_detected_count", 0)
                 app.logger.info(
                     "UPLOAD RESULT filename=%s document_type=%s "
                     "parent_rows=%s detail_rows=%s detail_status=%s",
@@ -3527,6 +3709,7 @@ def upload_files():
                     "workflow_id": workflow_id,
                     **inserted,
                 })
+                successful_content_digests.add(document_content_digest)
                 record_workflow_event(
                     workflow,
                     "workflow_complete",
@@ -3549,6 +3732,9 @@ def upload_files():
                             "po_detail_status",
                             "NOT_APPLICABLE",
                         ),
+                        "duplicate_content_detected_count": inserted[
+                            "duplicate_content_detected_count"
+                        ],
                         "duration_ms": workflow_duration_ms(workflow),
                     },
                 )

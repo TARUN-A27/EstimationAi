@@ -1,0 +1,14 @@
+{
+  "status": "Succeeded",
+  "result": {"analyzerId": "EstimationAi_V27_Unified", "contents": [{
+    "kind": "document", "startPageNumber": 1, "endPageNumber": 1,
+    "markdown": "<table><tr><td>EST NO</td><td>LM NO</td></tr><tr><td>180201</td><td>LM900201</td></tr><tr><td>180202</td><td>LM900202</td></tr></table>",
+    "fields": {
+      "DocumentType": {"type": "string", "valueString": "po"},
+      "PrimaryEstimationNumber": {"type": "string"},
+      "EstimationNumbers": {"type": "array", "valueArray": [{"type": "string", "valueString": "180201"}, {"type": "string", "valueString": "180202"}]},
+      "EstimationMappings": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180201"}, "ReferenceNumber": {"type": "string", "valueString": "LM900201"}}}, {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180202"}, "ReferenceNumber": {"type": "string", "valueString": "LM900202"}}}]},
+      "OrderLines": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180201"}, "MappingReferenceNumber": {"type": "string", "valueString": "LM900201"}}}, {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180202"}, "MappingReferenceNumber": {"type": "string", "valueString": "LM900202"}}}]}
+    }
+  }]}
+}

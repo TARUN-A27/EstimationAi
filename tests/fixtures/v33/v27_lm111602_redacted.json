@@ -1,0 +1,8 @@
+{
+  "status": "Succeeded",
+  "result": {"analyzerId": "EstimationAi_V27_Unified", "contents": [{
+    "kind": "document", "startPageNumber": 1, "endPageNumber": 1,
+    "markdown": "<table><tr><td>EST</td><td>NO</td><td></td><td>LMNO</td></tr><tr><td></td><td>180501</td><td></td><td>LMI90501</td></tr><tr><td></td><td>180502</td><td>LMI</td><td>90502</td></tr></table>",
+    "fields": {"DocumentType": {"type": "string", "valueString": "po"}, "PrimaryEstimationNumber": {"type": "string"}, "EstimationNumbers": {"type": "array", "valueArray": [{"type": "string", "valueString": "180501"}, {"type": "string", "valueString": "180502"}]}, "EstimationMappings": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180501"}, "ReferenceNumber": {"type": "string", "valueString": "LMI90501"}}}, {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180502"}, "ReferenceNumber": {"type": "string", "valueString": "LMI90502"}}}]}, "OrderLines": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180501"}, "MappingReferenceNumber": {"type": "string", "valueString": "LMI90501"}}}, {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180502"}, "MappingReferenceNumber": {"type": "string", "valueString": "LMI90502"}}}]}}
+  }]}
+}

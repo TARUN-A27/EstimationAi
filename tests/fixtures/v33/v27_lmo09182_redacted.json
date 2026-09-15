@@ -1,0 +1,8 @@
+{
+  "status": "Succeeded",
+  "result": {"analyzerId": "EstimationAi_V27_Unified", "contents": [{
+    "kind": "document", "startPageNumber": 1, "endPageNumber": 1,
+    "markdown": "<table><tr><td>EST NO</td><td>LMNO</td></tr><tr><td>180601</td><td>LM900601</td></tr></table>",
+    "fields": {"DocumentType": {"type": "string", "valueString": "po"}, "PrimaryEstimationNumber": {"type": "string"}, "EstimationNumbers": {"type": "array", "valueArray": [{"type": "string", "valueString": "180601"}]}, "EstimationMappings": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180601"}, "ReferenceNumber": {"type": "string", "valueString": "LM900601"}}}]}, "OrderLines": {"type": "array", "valueArray": [{"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180601"}, "MappingReferenceNumber": {"type": "string", "valueString": "LM900601"}}}]}}
+  }]}
+}

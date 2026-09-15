@@ -15,6 +15,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from difflib import SequenceMatcher
 from enum import Enum
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -349,6 +350,30 @@ def field_values(field: Any) -> list[str]:
     return []
 
 
+def field_values_excluding_pages(
+    field: Any,
+    ignored_page_numbers: set[int] | None,
+) -> list[str]:
+    """Read scalar/array values except those sourced only from ignored pages."""
+    if not isinstance(field, Mapping):
+        return []
+    if isinstance(field.get("valueArray"), list):
+        values: list[str] = []
+        for child in field["valueArray"]:
+            values.extend(
+                field_values_excluding_pages(child, ignored_page_numbers)
+            )
+        return values
+    source_pages = _field_source_pages(field)
+    if (
+        ignored_page_numbers
+        and source_pages
+        and source_pages.issubset(ignored_page_numbers)
+    ):
+        return []
+    return field_values(field)
+
+
 def first_field_value(field: Any) -> str | None:
     values = field_values(field)
     return values[0] if values else None
@@ -372,7 +397,69 @@ def content_fields(result_data: Mapping[str, Any]) -> Iterable[Mapping[str, Any]
             yield fields
 
 
-def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _field_source_pages(value: Any) -> set[int]:
+    """Return Azure source page numbers without retaining source contents."""
+    pages: set[int] = set()
+    if isinstance(value, Mapping):
+        source = value.get("source")
+        if isinstance(source, str):
+            match = re.match(r"D\((\d+),", source)
+            if match:
+                pages.add(int(match.group(1)))
+        for child in value.values():
+            pages.update(_field_source_pages(child))
+    elif isinstance(value, list):
+        for child in value:
+            pages.update(_field_source_pages(child))
+    return pages
+
+
+def _markdown_pages(result_data: Mapping[str, Any]) -> list[tuple[int, str]]:
+    pages: list[tuple[int, str]] = []
+    next_page_number = 1
+    for content in result_data.get("contents") or []:
+        if not isinstance(content, Mapping):
+            continue
+        markdown = content.get("markdown")
+        if not isinstance(markdown, str) or not markdown.strip():
+            continue
+        start_page = content.get("startPageNumber")
+        try:
+            next_page_number = int(start_page or next_page_number)
+        except (TypeError, ValueError):
+            pass
+        chunks = re.split(r"<!--\s*PageBreak\s*-->", markdown, flags=re.I)
+        for offset, chunk in enumerate(chunks):
+            pages.append((next_page_number + offset, chunk))
+        next_page_number += len(chunks)
+    return pages
+
+
+def _supporting_page_numbers(result_data: Mapping[str, Any]) -> set[int]:
+    """Identify explicit email/correspondence pages, never ordinary PO pages."""
+    supporting: set[int] = set()
+    for page_number, markdown in _markdown_pages(result_data):
+        normalized = " ".join(markdown.upper().split())
+        email_signals = sum(
+            bool(re.search(pattern, normalized))
+            for pattern in (
+                r"\bTO:\s*[^\s]+@",
+                r"\bFROM:\s*[^\s]+@",
+                r"\bSUBJECT:\s*",
+                r"\[QUOTED TEXT HIDDEN\]",
+                r"MAIL\.GOOGLE\.COM/MAIL/",
+            )
+        )
+        if email_signals >= 2 or (page_number > 1 and email_signals >= 1):
+            supporting.add(page_number)
+    return supporting
+
+
+def parse_order_lines(
+    result_data: Mapping[str, Any],
+    *,
+    ignored_page_numbers: set[int] | None = None,
+) -> list[dict[str, Any]]:
     order_lines: list[dict[str, Any]] = []
     for fields in content_fields(result_data):
         order_lines_field = (
@@ -385,6 +472,13 @@ def parse_order_lines(result_data: Mapping[str, Any]) -> list[dict[str, Any]]:
                 continue
             value_object = item.get("valueObject") or {}
             if not isinstance(value_object, Mapping):
+                continue
+            source_pages = _field_source_pages(value_object)
+            if (
+                ignored_page_numbers
+                and source_pages
+                and source_pages.issubset(ignored_page_numbers)
+            ):
                 continue
             order_lines.append(
                 {
@@ -485,15 +579,31 @@ def parse_tax_details(result_data: Mapping[str, Any]) -> list[dict[str, str]]:
     ]
 
 
-def parse_party_names(result_data: Mapping[str, Any]) -> list[str]:
+def parse_party_names(
+    result_data: Mapping[str, Any],
+    *,
+    ignored_page_numbers: set[int] | None = None,
+) -> list[str]:
     names: list[str] = []
     for fields in content_fields(result_data):
-        names.extend(field_values(named_field(fields, "PartyName")))
+        party_field = named_field(fields, "PartyName")
+        source_pages = _field_source_pages(party_field)
+        if (
+            ignored_page_numbers
+            and source_pages
+            and source_pages.issubset(ignored_page_numbers)
+        ):
+            continue
+        names.extend(
+            field_values_excluding_pages(party_field, ignored_page_numbers)
+        )
     return ordered_unique(name for name in names if name)
 
 
 def parse_estimation_mappings(
     result_data: Mapping[str, Any],
+    *,
+    ignored_page_numbers: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Parse semantic EST/reference pairs without altering stored values."""
     mappings: list[dict[str, Any]] = []
@@ -513,6 +623,13 @@ def parse_estimation_mappings(
                 continue
             value_object = item.get("valueObject") or {}
             if not isinstance(value_object, Mapping):
+                continue
+            source_pages = _field_source_pages(value_object)
+            if (
+                ignored_page_numbers
+                and source_pages
+                and source_pages.issubset(ignored_page_numbers)
+            ):
                 continue
             estimate_values = field_values(
                 named_field(
@@ -560,6 +677,200 @@ def parse_estimation_mappings(
                 }
             )
     return mappings
+
+
+class _MarkdownTableParser(HTMLParser):
+    """Small, non-rendering HTML table reader for Azure markdown."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table_depth = 0
+        self._rows: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell_parts: list[str] | None = None
+
+    def handle_starttag(self, tag: str, _attrs) -> None:
+        tag = tag.lower()
+        if tag == "table":
+            self._table_depth += 1
+            if self._table_depth == 1:
+                self._rows = []
+        elif self._table_depth == 1 and tag == "tr":
+            self._row = []
+        elif self._table_depth == 1 and tag in {"td", "th"}:
+            self._cell_parts = []
+        elif self._cell_parts is not None and tag == "br":
+            self._cell_parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if self._table_depth == 1 and tag in {"td", "th"}:
+            if self._row is not None and self._cell_parts is not None:
+                self._row.append(" ".join("".join(self._cell_parts).split()))
+            self._cell_parts = None
+        elif self._table_depth == 1 and tag == "tr":
+            if self._rows is not None and self._row is not None:
+                self._rows.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table_depth:
+            if self._table_depth == 1 and self._rows is not None:
+                self.tables.append(self._rows)
+                self._rows = None
+            self._table_depth -= 1
+
+
+def _pipe_markdown_tables(markdown: str) -> list[list[list[str]]]:
+    tables: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if line.startswith("|") and line.endswith("|"):
+            cells = [cell.strip() for cell in line[1:-1].split("|")]
+            if all(re.fullmatch(r":?-{3,}:?", cell or "-") for cell in cells):
+                continue
+            current.append(cells)
+        elif current:
+            tables.append(current)
+            current = []
+    if current:
+        tables.append(current)
+    return tables
+
+
+def _mapping_header_indexes(row: list[str]) -> tuple[int, int] | None:
+    keys = [identifier_key(cell) for cell in row]
+    est_index = next(
+        (
+            index
+            for index, key in enumerate(keys)
+            if key in {"ESTNO", "ESTIMATIONNO", "ESTIMATENO"}
+        ),
+        None,
+    )
+    if est_index is None:
+        est_index = next(
+            (
+                index
+                for index in range(len(keys) - 1)
+                if keys[index] in {"EST", "ESTIMATION", "ESTIMATE"}
+                and keys[index + 1] in {"NO", "NUMBER"}
+            ),
+            None,
+        )
+    reference_index = next(
+        (
+            index
+            for index, key in enumerate(keys)
+            if key in {"LMNO", "PONO", "ORDERNO"}
+        ),
+        None,
+    )
+    if reference_index is None:
+        reference_index = next(
+            (
+                index
+                for index in range(len(keys) - 1)
+                if keys[index] in {"LM", "PO", "ORDER"}
+                and keys[index + 1] in {"NO", "NUMBER"}
+            ),
+            None,
+        )
+    if (
+        est_index is None
+        or reference_index is None
+        or reference_index <= est_index
+    ):
+        return None
+    return est_index, reference_index
+
+
+def _valid_mapping_reference(value: Any) -> bool:
+    text = str(value or "").strip()
+    key = identifier_key(text)
+    return bool(text and len(text) <= 100 and key)
+
+
+def parse_markdown_estimation_mappings(
+    result_data: Mapping[str, Any],
+    *,
+    ignored_page_numbers: set[int] | None = None,
+) -> dict[str, Any]:
+    """Parse only bounded, explicitly headed EST/LM mapping tables."""
+    pairs: list[dict[str, Any]] = []
+    detected_count = 0
+    incomplete_count = 0
+    for page_number, markdown in _markdown_pages(result_data):
+        if ignored_page_numbers and page_number in ignored_page_numbers:
+            continue
+        parser = _MarkdownTableParser()
+        try:
+            parser.feed(markdown)
+        except Exception:
+            continue
+        tables = [*parser.tables, *_pipe_markdown_tables(markdown)]
+        for rows in tables:
+            for header_row_index, row in enumerate(rows):
+                indexes = _mapping_header_indexes(row)
+                if indexes is None:
+                    continue
+                detected_count += 1
+                est_index, _reference_index = indexes
+                table_pair_count = 0
+                for data_row in rows[header_row_index + 1 :]:
+                    padded = [*data_row, *([""] * max(0, len(row) - len(data_row)))]
+                    est_text = padded[est_index].strip()
+                    reference_text = "".join(
+                        cell.strip() for cell in padded[est_index + 1 :]
+                    )
+                    if not est_text and not reference_text:
+                        if table_pair_count:
+                            break
+                        continue
+                    if (
+                        re.fullmatch(r"\d{6}", est_text) is None
+                        or not _valid_mapping_reference(reference_text)
+                    ):
+                        incomplete_count += 1
+                        continue
+                    pairs.append(
+                        {
+                            "estimate_number": int(est_text),
+                            "reference_number": reference_text,
+                            "reference_numbers": [reference_text],
+                        }
+                    )
+                    table_pair_count += 1
+                break
+
+    unique_pairs: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[int, str]] = set()
+    estimates_to_references: dict[int, set[str]] = {}
+    references_to_estimates: dict[str, set[int]] = {}
+    for pair in pairs:
+        estimate = int(pair["estimate_number"])
+        reference_key = identifier_key(pair["reference_number"])
+        key = (estimate, reference_key)
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        unique_pairs.append(pair)
+        estimates_to_references.setdefault(estimate, set()).add(reference_key)
+        references_to_estimates.setdefault(reference_key, set()).add(estimate)
+    conflict_count = sum(
+        len(values) > 1 for values in estimates_to_references.values()
+    ) + sum(len(values) > 1 for values in references_to_estimates.values())
+    if conflict_count or incomplete_count:
+        unique_pairs = []
+    return {
+        "mappings": unique_pairs,
+        "mapping_table_detected_count": detected_count,
+        "mapping_conflict_count": conflict_count + incomplete_count,
+    }
 
 
 def normalize_document_type(value: Any) -> str:
@@ -636,6 +947,7 @@ def normalize_content_understanding_result(
         "EstimateNo",
         "EstNo",
     )
+    supporting_page_numbers = _supporting_page_numbers(result_data)
     for content in contents:
         if not isinstance(content, Mapping):
             raise ContentAnalysisError(
@@ -652,25 +964,41 @@ def normalize_content_understanding_result(
         type_values.extend(
             field_values(named_field(fields, "DocumentType", "DocumentCategory"))
         )
-        primary_estimation_values.extend(
-            field_values(
-                named_field(
-                    fields,
-                    "PrimaryEstimationNumber",
-                    "PrimaryEstimateNumber",
-                    "PrimaryEstimationNo",
-                    "PrimaryEstimateNo",
-                    "PrimaryEstNo",
+        primary_field = named_field(
+            fields,
+            "PrimaryEstimationNumber",
+            "PrimaryEstimateNumber",
+            "PrimaryEstimationNo",
+            "PrimaryEstimateNo",
+            "PrimaryEstNo",
+        )
+        primary_pages = _field_source_pages(primary_field)
+        if not (
+            supporting_page_numbers
+            and primary_pages
+            and primary_pages.issubset(supporting_page_numbers)
+        ):
+            primary_estimation_values.extend(
+                field_values_excluding_pages(
+                    primary_field,
+                    supporting_page_numbers,
                 )
             )
-        )
         for field_name in estimation_field_names:
+            estimation_field = named_field(fields, field_name)
+            estimation_pages = _field_source_pages(estimation_field)
+            if (
+                supporting_page_numbers
+                and estimation_pages
+                and estimation_pages.issubset(supporting_page_numbers)
+            ):
+                continue
             document_estimation_values.extend(
-                field_values(named_field(fields, field_name))
+                field_values_excluding_pages(
+                    estimation_field,
+                    supporting_page_numbers,
+                )
             )
-
-    order_lines = parse_order_lines(result_data)
-    estimation_mappings = parse_estimation_mappings(result_data)
 
     document_types = ordered_unique(
         normalized
@@ -683,6 +1011,138 @@ def normalize_content_understanding_result(
         document_type = document_types[0]
     else:
         document_type = "unknown"
+
+    order_lines = parse_order_lines(
+        result_data,
+        ignored_page_numbers=supporting_page_numbers,
+    )
+    legacy_estimation_numbers = ordered_unique(
+        str(number)
+        for number in (
+            normalize_estimation_number(value)
+            for value in document_estimation_values
+        )
+        if number is not None
+    )
+    semantic_mappings = parse_estimation_mappings(
+        result_data,
+        ignored_page_numbers=supporting_page_numbers,
+    )
+    semantic_pairs: list[dict[str, Any]] = []
+    semantic_pair_keys: set[tuple[int, str]] = set()
+    semantic_candidate_estimates: set[int] = set()
+    semantic_incomplete_count = 0
+    semantic_estimates_to_references: dict[int, set[str]] = {}
+    semantic_references_to_estimates: dict[str, set[int]] = {}
+    for mapping in semantic_mappings:
+        estimation_number = mapping.get("estimate_number")
+        reference_numbers = mapping.get("reference_numbers") or []
+        if estimation_number is not None:
+            semantic_candidate_estimates.add(int(estimation_number))
+        if (
+            estimation_number is None
+            or len(reference_numbers) != 1
+            or not _valid_mapping_reference(reference_numbers[0])
+        ):
+            semantic_incomplete_count += 1
+            continue
+        reference = str(reference_numbers[0]).strip()
+        reference_key = identifier_key(reference)
+        pair_key = (int(estimation_number), reference_key)
+        semantic_estimates_to_references.setdefault(
+            int(estimation_number), set()
+        ).add(reference_key)
+        semantic_references_to_estimates.setdefault(
+            reference_key, set()
+        ).add(int(estimation_number))
+        if pair_key in semantic_pair_keys:
+            continue
+        semantic_pair_keys.add(pair_key)
+        semantic_pairs.append(
+            {
+                "estimate_number": int(estimation_number),
+                "reference_number": reference,
+                "reference_numbers": [reference],
+            }
+        )
+    semantic_conflict_count = sum(
+        len(values) > 1
+        for values in semantic_estimates_to_references.values()
+    ) + sum(
+        len(values) > 1
+        for values in semantic_references_to_estimates.values()
+    )
+    fallback_result = (
+        parse_markdown_estimation_mappings(
+            result_data,
+            ignored_page_numbers=supporting_page_numbers,
+        )
+        if document_type == "po"
+        else {
+            "mappings": [],
+            "mapping_table_detected_count": 0,
+            "mapping_conflict_count": 0,
+        }
+    )
+    fallback_mappings = fallback_result["mappings"]
+    semantic_pair_estimates = {
+        int(mapping["estimate_number"]) for mapping in semantic_pairs
+    }
+    required_mapping_estimates = {
+        *(int(value) for value in legacy_estimation_numbers),
+        *semantic_candidate_estimates,
+    }
+    semantic_covers_document = required_mapping_estimates.issubset(
+        semantic_pair_estimates
+    )
+    semantic_complete = bool(semantic_pairs) and not (
+        semantic_incomplete_count or semantic_conflict_count
+    )
+    fallback_keys = {
+        (
+            int(mapping["estimate_number"]),
+            identifier_key(mapping["reference_number"]),
+        )
+        for mapping in fallback_mappings
+    }
+    fallback_estimates = {
+        int(mapping["estimate_number"]) for mapping in fallback_mappings
+    }
+    fallback_complete = bool(fallback_mappings) and (
+        semantic_pair_keys.issubset(fallback_keys)
+        and required_mapping_estimates.issubset(fallback_estimates)
+    )
+    fallback_used = False
+    mapping_conflict_count = 0
+    if document_type != "po":
+        # Estimation and mixing documents do not use the PO mapping-table
+        # completeness gate. Retain their pre-V33 normalization behavior.
+        estimation_mappings = (
+            [] if semantic_conflict_count else semantic_pairs
+        )
+        mapping_conflict_count = semantic_conflict_count
+    elif semantic_complete:
+        estimation_mappings = semantic_pairs
+    elif fallback_complete:
+        estimation_mappings = fallback_mappings
+        fallback_used = True
+    else:
+        # A partial semantic mapping set must never become parent identity.
+        # A markdown table can replace it only when the bounded table covers
+        # every surviving semantic pair and every document-level EST.
+        estimation_mappings = []
+        if semantic_mappings:
+            mapping_conflict_count = max(
+                1,
+                semantic_conflict_count
+                + semantic_incomplete_count
+                + int(not semantic_covers_document),
+            )
+        elif fallback_mappings and not fallback_complete:
+            mapping_conflict_count = 1
+        mapping_conflict_count += fallback_result[
+            "mapping_conflict_count"
+        ]
 
     primary_estimation_numbers = ordered_unique(
         str(number)
@@ -698,14 +1158,6 @@ def normalize_content_understanding_result(
         else None
     )
     primary_estimation_present = bool(primary_estimation_values)
-    legacy_estimation_numbers = ordered_unique(
-        str(number)
-        for number in (
-            normalize_estimation_number(value)
-            for value in document_estimation_values
-        )
-        if number is not None
-    )
     line_estimation_numbers = ordered_unique(
         str(number)
         for line in order_lines
@@ -782,6 +1234,20 @@ def normalize_content_understanding_result(
         "primary_estimation_present": primary_estimation_present,
         "primary_estimation_number": primary_estimation_number,
         "estimation_mappings": estimation_mappings,
+        "semantic_mapping_count": len(semantic_pairs),
+        "fallback_mapping_count": (
+            len(fallback_mappings) if fallback_used else 0
+        ),
+        "mapping_table_detected_count": fallback_result[
+            "mapping_table_detected_count"
+        ],
+        "mapping_fallback_used_count": int(fallback_used),
+        "mapping_conflict_count": mapping_conflict_count,
+        "supporting_page_ignored_count": len(supporting_page_numbers),
+        "original_document_mapping_count": (
+            len(estimation_mappings)
+            or len(effective_estimation_numbers)
+        ),
         "legacy_estimation_numbers": [
             int(value) for value in legacy_estimation_numbers
         ],
@@ -799,7 +1265,10 @@ def normalize_content_understanding_result(
             int(value) for value in line_estimation_numbers
         ],
         "order_lines": order_lines,
-        "party_names": parse_party_names(result_data),
+        "party_names": parse_party_names(
+            result_data,
+            ignored_page_numbers=supporting_page_numbers,
+        ),
         "analysis_source": CONTENT_UNDERSTANDING_SOURCE,
         "warnings": warnings,
     }
@@ -856,6 +1325,21 @@ def analyze_uploaded_document(
             "estimation_mapping_count": len(
                 normalized["estimation_mappings"]
             ),
+            "semantic_mapping_count": normalized["semantic_mapping_count"],
+            "fallback_mapping_count": normalized["fallback_mapping_count"],
+            "mapping_table_detected_count": normalized[
+                "mapping_table_detected_count"
+            ],
+            "mapping_fallback_used_count": normalized[
+                "mapping_fallback_used_count"
+            ],
+            "mapping_conflict_count": normalized["mapping_conflict_count"],
+            "supporting_page_ignored_count": normalized[
+                "supporting_page_ignored_count"
+            ],
+            "original_document_mapping_count": normalized[
+                "original_document_mapping_count"
+            ],
             "document_estimation_count": len(
                 normalized["document_estimation_numbers"]
             ),
@@ -877,6 +1361,21 @@ def analyze_uploaded_document(
             "estimation_mapping_count": len(
                 normalized["estimation_mappings"]
             ),
+            "semantic_mapping_count": normalized["semantic_mapping_count"],
+            "fallback_mapping_count": normalized["fallback_mapping_count"],
+            "mapping_table_detected_count": normalized[
+                "mapping_table_detected_count"
+            ],
+            "mapping_fallback_used_count": normalized[
+                "mapping_fallback_used_count"
+            ],
+            "mapping_conflict_count": normalized["mapping_conflict_count"],
+            "supporting_page_ignored_count": normalized[
+                "supporting_page_ignored_count"
+            ],
+            "original_document_mapping_count": normalized[
+                "original_document_mapping_count"
+            ],
             "document_estimation_count": len(
                 normalized["document_estimation_numbers"]
             ),
@@ -2059,6 +2558,7 @@ def build_extracted_po_document_detail_result(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
     *,
+    original_estimation_order_mappings: Iterable[Mapping[str, Any]] | None = None,
     certificate_master_entries: Iterable[Any] | None = None,
     oracle_expected_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -2070,22 +2570,34 @@ def build_extracted_po_document_detail_result(
     The legacy no-Oracle mode remains available to diagnostic callers.
     """
 
-    mappings: list[dict[str, Any]] = []
-    for raw_mapping in estimation_order_mappings:
-        estimation_number = str(
-            raw_mapping.get("estimation_no") or ""
-        ).strip()
-        regular_order_number = str(
-            raw_mapping.get("regular_order_number") or ""
-        ).strip()
-        if not estimation_number or not regular_order_number:
-            raise ValueError("Incomplete EST-to-order mapping")
-        mappings.append(
-            {
-                "estimation_number": estimation_number,
-                "regular_order_number": regular_order_number,
-            }
-        )
+    def prepared_mappings(
+        source: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        prepared: list[dict[str, Any]] = []
+        for raw_mapping in source:
+            estimation_number = str(
+                raw_mapping.get("estimation_no") or ""
+            ).strip()
+            regular_order_number = str(
+                raw_mapping.get("regular_order_number") or ""
+            ).strip()
+            if not estimation_number or not regular_order_number:
+                raise ValueError("Incomplete EST-to-order mapping")
+            prepared.append(
+                {
+                    "estimation_number": estimation_number,
+                    "regular_order_number": regular_order_number,
+                }
+            )
+        return prepared
+
+    retained_mapping_source = list(estimation_order_mappings)
+    mappings = prepared_mappings(retained_mapping_source)
+    original_mappings = prepared_mappings(
+        original_estimation_order_mappings
+        if original_estimation_order_mappings is not None
+        else retained_mapping_source
+    )
 
     # Production detail storage preserves the analyzer output. The legacy
     # sanitization/comparison path remains available for diagnostics only.
@@ -2141,9 +2653,13 @@ def build_extracted_po_document_detail_result(
             )
         return format(distinct[0], "f")
 
-    mapping_by_estimation = {
+    retained_mapping_by_estimation = {
         mapping["estimation_number"]: mapping
         for mapping in mappings
+    }
+    mapping_by_estimation = {
+        mapping["estimation_number"]: mapping
+        for mapping in original_mappings
     }
     ordered_mapping_fallbacks: list[dict[str, Any]] | None = None
     semantic_mappings = list(
@@ -2152,19 +2668,6 @@ def build_extracted_po_document_detail_result(
     if (
         len(mapping_by_estimation) > 1
         and len(semantic_mappings) == len(order_lines)
-        and all(
-            not any(
-                str(value).strip()
-                for value in (line.get("estimate_number") or [])
-            )
-            and not any(
-                str(value).strip()
-                for value in (
-                    line.get("mapping_reference_number") or []
-                )
-            )
-            for line in order_lines
-        )
     ):
         ordered_estimation_keys: list[str] = []
         for semantic_mapping in semantic_mappings:
@@ -2231,6 +2734,11 @@ def build_extracted_po_document_detail_result(
         "single_parent_fallback_count": 0,
         "ordered_mapping_fallback_count": 0,
     }
+    original_document_mapping_count = int(
+        result_data.get("original_document_mapping_count")
+        if result_data.get("original_document_mapping_count") is not None
+        else len(semantic_mappings) or len(mapping_by_estimation)
+    )
     certification_counts = {
         "certification_present_count": 0,
         "certification_master_match_count": 0,
@@ -2325,13 +2833,20 @@ def build_extracted_po_document_detail_result(
                                 "Certification master match is ambiguous"
                             )
 
-            raw_estimate_values = line.get("estimate_number") or []
+            raw_estimate_values = _as_field_values(
+                line.get("estimate_number")
+            )
+            estimate_value_present = any(
+                value is not None and str(value).strip()
+                for value in raw_estimate_values
+            )
             estimate_keys = extracted_estimation_keys(raw_estimate_values)
-            if len(estimate_keys) > 1:
+            if estimate_value_present and len(estimate_keys) != 1:
                 raise ValueError(
-                    "Extracted EstimateNumber is ambiguous on this line"
+                    "Extracted EstimateNumber is invalid or ambiguous "
+                    "on this line"
                 )
-            if len(estimate_keys) == 1:
+            if estimate_value_present:
                 estimate_key = next(iter(estimate_keys))
                 mapping = mapping_by_estimation.get(estimate_key)
                 if mapping is None:
@@ -2341,10 +2856,14 @@ def build_extracted_po_document_detail_result(
                 association_counts["direct_line_mapping_count"] += 1
             else:
                 reference_estimation_keys: set[str] = set()
-                mapping_reference_values = (
-                    line.get("mapping_reference_number") or []
+                mapping_reference_values = _as_field_values(
+                    line.get("mapping_reference_number")
                 )
-                if mapping_reference_values:
+                mapping_reference_present = any(
+                    value is not None and str(value).strip()
+                    for value in mapping_reference_values
+                )
+                if mapping_reference_present:
                     association_values = mapping_reference_values
                     association_field = "MappingReferenceNumber"
                     association_count = (
@@ -2371,11 +2890,11 @@ def build_extracted_po_document_detail_result(
                         f"Extracted {association_field} maps this line to "
                         "multiple resolved EST values"
                     )
-                elif len(mapping_by_estimation) == 1:
-                    mapping = next(iter(mapping_by_estimation.values()))
-                    association_counts[
-                        "single_parent_fallback_count"
-                    ] += 1
+                elif mapping_reference_present:
+                    raise ValueError(
+                        "Extracted MappingReferenceNumber has no resolved "
+                        "EST mapping"
+                    )
                 elif (
                     ordered_mapping_fallbacks is not None
                 ):
@@ -2389,6 +2908,14 @@ def build_extracted_po_document_detail_result(
                     association_counts[
                         "ordered_mapping_fallback_count"
                     ] += 1
+                elif (
+                    original_document_mapping_count == 1
+                    and len(mapping_by_estimation) == 1
+                ):
+                    mapping = next(iter(mapping_by_estimation.values()))
+                    association_counts[
+                        "single_parent_fallback_count"
+                    ] += 1
                 else:
                     raise ValueError(
                         "Cannot uniquely associate this line with one "
@@ -2397,6 +2924,14 @@ def build_extracted_po_document_detail_result(
                     )
 
             estimation_key = mapping["estimation_number"]
+            retained_mapping = retained_mapping_by_estimation.get(
+                estimation_key
+            )
+            if retained_mapping is None:
+                raise ValueError(
+                    "OrderLine is associated with a non-retained PO parent"
+                )
+            mapping = retained_mapping
             if v32_enabled:
                 oracle_candidates = (
                     oracle_rows_by_estimation.get(estimation_key) or []
@@ -2485,6 +3020,8 @@ def build_extracted_po_document_detail_result(
         "rows": rows,
         "rejected_lines": rejected_lines,
         "association_counts": association_counts,
+        "original_document_mapping_count": original_document_mapping_count,
+        "retained_mapping_count": len(retained_mapping_by_estimation),
         "certification_counts": certification_counts,
         "field_validation_results": field_validation_results,
         "field_validation_counts": field_validation_counts,
@@ -2495,6 +3032,7 @@ def build_extracted_po_document_detail_rows(
     result_data: Mapping[str, Any],
     estimation_order_mappings: Iterable[Mapping[str, Any]],
     *,
+    original_estimation_order_mappings: Iterable[Mapping[str, Any]] | None = None,
     certificate_master_entries: Iterable[Any] | None = None,
     oracle_expected_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -2503,6 +3041,7 @@ def build_extracted_po_document_detail_rows(
     return build_extracted_po_document_detail_result(
         result_data,
         estimation_order_mappings,
+        original_estimation_order_mappings=original_estimation_order_mappings,
         certificate_master_entries=certificate_master_entries,
         oracle_expected_rows=oracle_expected_rows,
     )["rows"]

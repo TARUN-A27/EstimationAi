@@ -111,7 +111,7 @@ class OrderedMappingFallbackV30Tests(unittest.TestCase):
         self.assertEqual(details["rows"], [])
         self.assertEqual(len(details["rejected_lines"]), 2)
 
-    def test_explicit_unresolved_mapping_reference_blocks_fallback(self):
+    def test_explicit_unresolved_mapping_reference_rejects_only_affected_line(self):
         details = self.build(
             semantic_mappings=[
                 (174702, "LM111177"),
@@ -127,13 +127,24 @@ class OrderedMappingFallbackV30Tests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(details["rows"], [])
-        self.assertEqual(len(details["rejected_lines"]), 2)
+        self.assertEqual(
+            [row["estimation_number"] for row in details["rows"]],
+            [174704],
+        )
+        self.assertEqual(len(details["rejected_lines"]), 1)
+        self.assertEqual(
+            details["rejected_lines"][0]["source_line_number"],
+            1,
+        )
+        self.assertIn(
+            "MappingReferenceNumber",
+            details["rejected_lines"][0]["reason"],
+        )
         self.assertEqual(
             details["association_counts"][
                 "ordered_mapping_fallback_count"
             ],
-            0,
+            1,
         )
 
     def test_direct_estimation_still_has_priority(self):

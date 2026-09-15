@@ -75,7 +75,11 @@ class PoDetailsNoMatchingV11Tests(unittest.TestCase):
         self.assertEqual(len(calls[0].args), 2)
         self.assertEqual(
             [keyword.arg for keyword in calls[0].keywords],
-            ["certificate_master_entries", "oracle_expected_rows"],
+            [
+                "original_estimation_order_mappings",
+                "certificate_master_entries",
+                "oracle_expected_rows",
+            ],
         )
         self.assertNotIn("fetch_expected_party_names", source)
         self.assertIn("fetch_certificate_master_entries", source)

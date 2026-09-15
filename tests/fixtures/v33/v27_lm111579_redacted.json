@@ -1,0 +1,25 @@
+{
+  "status": "Succeeded",
+  "result": {
+    "analyzerId": "EstimationAi_V27_Unified",
+    "contents": [{
+      "kind": "document",
+      "startPageNumber": 1,
+      "endPageNumber": 1,
+      "markdown": "<table><tr><td>EST NO</td><td>LM NO</td></tr><tr><td>180101</td><td>LM900101</td></tr><tr><td>180102</td><td>LM900102</td></tr></table>",
+      "fields": {
+        "DocumentType": {"type": "string", "valueString": "po"},
+        "PrimaryEstimationNumber": {"type": "string", "confidence": 0.9},
+        "EstimationNumbers": {"type": "array", "valueArray": [{"type": "string", "valueString": "180101"}, {"type": "string", "valueString": "180102"}]},
+        "EstimationMappings": {"type": "array", "valueArray": [
+          {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180101", "confidence": 0.9, "spans": [{"offset": 1, "length": 6}], "source": "D(1,1,1,2,1,2,2,1,2)"}, "ReferenceNumber": {"type": "string", "valueString": "LM900101", "confidence": 0.9, "spans": [{"offset": 8, "length": 8}], "source": "D(1,2,1,3,1,3,2,2,2)"}}},
+          {"type": "object", "valueObject": {"EstimateNumber": {"type": "string", "valueString": "180102"}, "ReferenceNumber": {"type": "string", "valueString": "LM900102"}}}
+        ]},
+        "OrderLines": {"type": "array", "valueArray": [
+          {"type": "object", "valueObject": {"EstimateNumber": {"type": "string"}, "MappingReferenceNumber": {"type": "string", "valueString": "REDACTED-SHADE"}, "Count": {"type": "string", "valueString": "REDACTED-COUNT"}}},
+          {"type": "object", "valueObject": {"EstimateNumber": {"type": "string"}, "MappingReferenceNumber": {"type": "string", "valueString": "REDACTED-SHADE"}, "Count": {"type": "string", "valueString": "REDACTED-COUNT"}}}
+        ]}
+      }
+    }]
+  }
+}
