@@ -916,6 +916,8 @@ def normalize_estimation_number(value: Any) -> int | None:
 
 def normalize_content_understanding_result(
     result_data: Mapping[str, Any],
+    *,
+    expected_document_type: str | None = None,
 ) -> dict[str, Any]:
     """Convert the configured analyzer response to the production contract."""
     if not isinstance(result_data, Mapping):
@@ -1012,6 +1014,24 @@ def normalize_content_understanding_result(
     else:
         document_type = "unknown"
 
+    # Not every configured analyzer schema returns a DocumentType/category
+    # field (some PO-only analyzers only return OrderLines/PartyName/etc).
+    # When Azure gives us nothing to classify with, an EST-No/LM-No (or
+    # PO-No) mapping table found anywhere on the page is itself evidence
+    # this is a PO document; the caller's own upload-time expectation is
+    # the last resort.
+    mapping_table_scan = parse_markdown_estimation_mappings(
+        result_data,
+        ignored_page_numbers=supporting_page_numbers,
+    )
+    if document_type == "unknown":
+        if mapping_table_scan["mappings"]:
+            document_type = "po"
+        else:
+            expected_type = normalize_document_type(expected_document_type)
+            if expected_type != "unknown":
+                document_type = expected_type
+
     order_lines = parse_order_lines(
         result_data,
         ignored_page_numbers=supporting_page_numbers,
@@ -1073,10 +1093,7 @@ def normalize_content_understanding_result(
         for values in semantic_references_to_estimates.values()
     )
     fallback_result = (
-        parse_markdown_estimation_mappings(
-            result_data,
-            ignored_page_numbers=supporting_page_numbers,
-        )
+        mapping_table_scan
         if document_type == "po"
         else {
             "mappings": [],
@@ -1085,33 +1102,26 @@ def normalize_content_understanding_result(
         }
     )
     fallback_mappings = fallback_result["mappings"]
-    semantic_pair_estimates = {
-        int(mapping["estimate_number"]) for mapping in semantic_pairs
-    }
     required_mapping_estimates = {
         *(int(value) for value in legacy_estimation_numbers),
         *semantic_candidate_estimates,
     }
     semantic_covers_document = required_mapping_estimates.issubset(
-        semantic_pair_estimates
+        {int(mapping["estimate_number"]) for mapping in semantic_pairs}
     )
     semantic_complete = bool(semantic_pairs) and not (
         semantic_incomplete_count or semantic_conflict_count
     )
-    fallback_keys = {
-        (
-            int(mapping["estimate_number"]),
-            identifier_key(mapping["reference_number"]),
-        )
-        for mapping in fallback_mappings
-    }
-    fallback_estimates = {
-        int(mapping["estimate_number"]) for mapping in fallback_mappings
-    }
-    fallback_complete = bool(fallback_mappings) and (
-        semantic_pair_keys.issubset(fallback_keys)
-        and required_mapping_estimates.issubset(fallback_estimates)
+    # A table's own pairs are already cleared to [] by
+    # parse_markdown_estimation_mappings() when it finds an internal
+    # conflict, so any non-empty result here is already self-consistent.
+    # It must still cover every EST the document itself claims to have,
+    # same as the semantic path below - a partial table must never become
+    # parent identity either.
+    table_covers_document = required_mapping_estimates.issubset(
+        {int(mapping["estimate_number"]) for mapping in fallback_mappings}
     )
+    table_scan_complete = bool(fallback_mappings) and table_covers_document
     fallback_used = False
     mapping_conflict_count = 0
     if document_type != "po":
@@ -1121,25 +1131,26 @@ def normalize_content_understanding_result(
             [] if semantic_conflict_count else semantic_pairs
         )
         mapping_conflict_count = semantic_conflict_count
-    elif semantic_complete:
-        estimation_mappings = semantic_pairs
-    elif fallback_complete:
+    elif table_scan_complete:
+        # PO insertion trusts the EST-No/LM-No table scan (label pair found
+        # anywhere on any page) as the primary source; Azure's structured
+        # schema fields are only a fallback for this document type.
         estimation_mappings = fallback_mappings
         fallback_used = True
+    elif semantic_complete:
+        estimation_mappings = semantic_pairs
     else:
-        # A partial semantic mapping set must never become parent identity.
-        # A markdown table can replace it only when the bounded table covers
-        # every surviving semantic pair and every document-level EST.
+        # A partial mapping set must never become parent identity.
         estimation_mappings = []
-        if semantic_mappings:
+        if fallback_mappings and not table_scan_complete:
+            mapping_conflict_count = 1
+        elif semantic_mappings:
             mapping_conflict_count = max(
                 1,
                 semantic_conflict_count
                 + semantic_incomplete_count
                 + int(not semantic_covers_document),
             )
-        elif fallback_mappings and not fallback_complete:
-            mapping_conflict_count = 1
         mapping_conflict_count += fallback_result[
             "mapping_conflict_count"
         ]
@@ -1289,7 +1300,10 @@ def analyze_uploaded_document(
         audit=audit,
     )
     try:
-        normalized = normalize_content_understanding_result(raw_result)
+        normalized = normalize_content_understanding_result(
+            raw_result,
+            expected_document_type=expected_document_type,
+        )
     except ContentAnalysisError:
         _audit(
             audit,
