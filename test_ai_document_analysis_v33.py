@@ -392,6 +392,83 @@ class MarkdownFallbackV33Tests(unittest.TestCase):
         self.assertEqual(result["mapping_conflict_count"], 0)
 
 
+    def test_smudged_stamp_header_is_located_by_row_shape(self):
+        result = normalize_content_understanding_result(
+            raw_response(
+                document_type="unknown",
+                markdown=(
+                    "<table><tr><td>EST : )</td><td>N</td></tr>"
+                    "<tr><td>180101</td><td>LM900101</td></tr>"
+                    "<tr><td>180102</td><td>LM900102</td></tr></table>"
+                ),
+            )
+        )
+        self.assertEqual(result["document_type"], "po")
+        self.assertEqual(result["mapping_estimation_numbers"], [180101, 180102])
+        self.assertEqual(result["mapping_conflict_count"], 0)
+
+    def test_row_shape_never_skips_a_smudged_row_or_takes_an_item_table(self):
+        for markdown in (
+            # A smudged first data row must block, not be skipped as a header.
+            "<table><tr><td>17010 1</td><td>LM900101</td></tr>"
+            "<tr><td>180102</td><td>LM900102</td></tr></table>",
+            # An ordinary item table is not a stamp.
+            "<table><tr><td>SNo</td><td>COUNTS</td></tr>"
+            "<tr><td>180101</td><td>30 S COTTON</td></tr></table>",
+        ):
+            with self.subTest(markdown=markdown):
+                result = normalize_content_understanding_result(
+                    raw_response(markdown=markdown)
+                )
+                self.assertEqual(result["estimation_mappings"], [])
+                self.assertEqual(result["mapping_table_detected_count"], 0)
+
+    def test_stamp_reference_is_reduced_to_its_order_number(self):
+        result = self.normalize_table(
+            [
+                ("180101", "LM900101 TOTAL:"),  # overlapped printed text
+                ("180102", "LM90/102"),  # handwritten 1 read as a slash
+                ("180103", "LM900103 LM900104"),  # ambiguous: left untouched
+            ]
+        )
+        self.assertEqual(
+            [item["reference_number"] for item in result["estimation_mappings"]],
+            ["LM900101", "LM901102", "LM900103 LM900104"],
+        )
+
+    def test_stamp_on_an_email_printout_is_the_po_not_supporting_mail(self):
+        result = normalize_content_understanding_result(
+            raw_response(
+                document_type="unknown",
+                markdown=(
+                    "To: redacted@example.invalid\n"
+                    "<table><tr><td>EST NO</td><td>LM NO</td></tr>"
+                    "<tr><td>180101</td><td>LM900101</td></tr></table>\n"
+                    "<!-- PageFooter: https://mail.google.com/mail/u/0/?ik=x -->"
+                ),
+            )
+        )
+        self.assertEqual(result["supporting_page_ignored_count"], 0)
+        self.assertEqual(result["mapping_estimation_numbers"], [180101])
+
+    def test_written_est_note_needs_its_label_and_an_order_number(self):
+        note = normalize_content_understanding_result(
+            raw_response(document_type="unknown", markdown="Est: 180101\nEMO90101")
+        )
+        self.assertEqual(note["document_type"], "po")
+        self.assertEqual(note["mapping_estimation_numbers"], [180101])
+        for markdown in (
+            "Est: 180101",
+            "180101\nEMO90101",
+            "ESTIMATE 180101 EMO90101",
+        ):
+            with self.subTest(markdown=markdown):
+                result = normalize_content_understanding_result(
+                    raw_response(markdown=markdown)
+                )
+                self.assertEqual(result["estimation_mappings"], [])
+
+
 class SemanticMappingCompletenessV33Tests(unittest.TestCase):
     @staticmethod
     def mapping_table(*pairs):

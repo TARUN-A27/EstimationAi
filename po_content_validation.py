@@ -450,7 +450,12 @@ def _supporting_page_numbers(result_data: Mapping[str, Any]) -> set[int]:
                 r"MAIL\.GOOGLE\.COM/MAIL/",
             )
         )
-        if email_signals >= 2 or (page_number > 1 and email_signals >= 1):
+        if (
+            (email_signals >= 2 or (page_number > 1 and email_signals >= 1))
+            # The EST NO/LM NO stamp marks the PO itself (e.g. a PO received
+            # as an email and printed), so its page is never mere mail.
+            and not any(map(_mapping_table_start, _page_tables(markdown)))
+        ):
             supporting.add(page_number)
     return supporting
 
@@ -789,10 +794,88 @@ def _mapping_header_indexes(row: list[str]) -> tuple[int, int] | None:
     return est_index, reference_index
 
 
+def _page_tables(markdown: str) -> list[list[list[str]]]:
+    parser = _MarkdownTableParser()
+    try:
+        parser.feed(markdown)
+    except Exception:
+        return []
+    return [*parser.tables, *_pipe_markdown_tables(markdown)]
+
+
+_ORDER_NUMBER = r"[A-Z]{1,4}\d{4,9}"  # LM111785, LMO09182, EMO16598
+
+
+def _clean_order_reference(text: str) -> str:
+    """Reduce a stamp's LM cell to the order number it clearly holds.
+
+    An overlapping stamp can pick up printed text ("LM111819 TOTAL:"), and a
+    handwritten 1 is often read as a slash ("LM11/727"); a slash can never be
+    part of an order number. Anything else is returned untouched.
+    """
+    folded = re.sub(r"(?<=\d)[/|!](?=\d)", "1", text).upper()
+    tokens = re.findall(rf"(?<![A-Z0-9]){_ORDER_NUMBER}(?![A-Z0-9])", folded)
+    return tokens[0] if len(tokens) == 1 else text
+
+
+def _mapping_table_start(rows: list[list[str]]) -> tuple[int, int] | None:
+    """Locate a stamp table as (header row index, EST column).
+
+    The header normally reads EST NO / LM NO. A smudged or folded stamp can
+    scramble it ("EST : )" / "N"), so fall back to the row shape: a six-digit
+    EST cell followed by nothing but an order number. Only a digit-free row may
+    be skipped as the header; a smudged data row is never silently dropped.
+    """
+    for row_index, row in enumerate(rows):
+        indexes = _mapping_header_indexes(row)
+        if indexes is not None:
+            return row_index, indexes[0]
+    for row_index, row in enumerate(rows[:2]):
+        cells = [cell.strip() for cell in row]
+        est_index = next((i for i, cell in enumerate(cells) if cell), None)
+        if (
+            est_index is not None
+            and re.fullmatch(r"\d{6}", cells[est_index])
+            and re.fullmatch(
+                _ORDER_NUMBER,
+                identifier_key(
+                    _clean_order_reference("".join(cells[est_index + 1 :]))
+                ),
+            )
+        ):
+            return row_index - 1, est_index
+        if any(char.isdigit() for cell in cells for char in cell):
+            return None
+    return None
+
+
 def _valid_mapping_reference(value: Any) -> bool:
     text = str(value or "").strip()
     key = identifier_key(text)
     return bool(text and len(text) <= 100 and key)
+
+
+# A written note such as "Est: 176273" directly followed by its order number.
+# The EST label is mandatory; bare digits never qualify.
+_ESTIMATION_NOTE = re.compile(
+    r"\bEST(?![A-Z])\.?\s*(?:NO\.?|NUMBER)?\s*[:.\-]?\s*(\d{6})(?!\d)"
+    r"[\s,;]*([A-Z]{1,4}\s*-?\s*\d{4,9})(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+
+
+def _handwritten_estimation_pairs(markdown: str) -> list[dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    for estimate, reference in _ESTIMATION_NOTE.findall(markdown):
+        reference = re.sub(r"\s+", "", reference)
+        pairs.append(
+            {
+                "estimate_number": int(estimate),
+                "reference_number": reference,
+                "reference_numbers": [reference],
+            }
+        )
+    return pairs
 
 
 def parse_markdown_estimation_mappings(
@@ -800,52 +883,53 @@ def parse_markdown_estimation_mappings(
     *,
     ignored_page_numbers: set[int] | None = None,
 ) -> dict[str, Any]:
-    """Parse only bounded, explicitly headed EST/LM mapping tables."""
+    """Parse bounded EST/order mapping tables, found by header or row shape.
+
+    A page without such a table may instead carry an explicit written
+    "Est: ######" note followed by its order number.
+    """
     pairs: list[dict[str, Any]] = []
     detected_count = 0
     incomplete_count = 0
     for page_number, markdown in _markdown_pages(result_data):
         if ignored_page_numbers and page_number in ignored_page_numbers:
             continue
-        parser = _MarkdownTableParser()
-        try:
-            parser.feed(markdown)
-        except Exception:
-            continue
-        tables = [*parser.tables, *_pipe_markdown_tables(markdown)]
-        for rows in tables:
-            for header_row_index, row in enumerate(rows):
-                indexes = _mapping_header_indexes(row)
-                if indexes is None:
+        page_tables = 0
+        for rows in _page_tables(markdown):
+            start = _mapping_table_start(rows)
+            if start is None:
+                continue
+            detected_count += 1
+            page_tables += 1
+            header_row_index, est_index = start
+            width = max(map(len, rows))
+            table_pair_count = 0
+            for data_row in rows[header_row_index + 1 :]:
+                padded = [*data_row, *([""] * (width - len(data_row)))]
+                est_text = padded[est_index].strip()
+                reference_text = _clean_order_reference(
+                    "".join(cell.strip() for cell in padded[est_index + 1 :])
+                )
+                if not est_text and not reference_text:
+                    if table_pair_count:
+                        break
                     continue
-                detected_count += 1
-                est_index, _reference_index = indexes
-                table_pair_count = 0
-                for data_row in rows[header_row_index + 1 :]:
-                    padded = [*data_row, *([""] * max(0, len(row) - len(data_row)))]
-                    est_text = padded[est_index].strip()
-                    reference_text = "".join(
-                        cell.strip() for cell in padded[est_index + 1 :]
-                    )
-                    if not est_text and not reference_text:
-                        if table_pair_count:
-                            break
-                        continue
-                    if (
-                        re.fullmatch(r"\d{6}", est_text) is None
-                        or not _valid_mapping_reference(reference_text)
-                    ):
-                        incomplete_count += 1
-                        continue
-                    pairs.append(
-                        {
-                            "estimate_number": int(est_text),
-                            "reference_number": reference_text,
-                            "reference_numbers": [reference_text],
-                        }
-                    )
-                    table_pair_count += 1
-                break
+                if (
+                    re.fullmatch(r"\d{6}", est_text) is None
+                    or not _valid_mapping_reference(reference_text)
+                ):
+                    incomplete_count += 1
+                    continue
+                pairs.append(
+                    {
+                        "estimate_number": int(est_text),
+                        "reference_number": reference_text,
+                        "reference_numbers": [reference_text],
+                    }
+                )
+                table_pair_count += 1
+        if not page_tables:
+            pairs.extend(_handwritten_estimation_pairs(markdown))
 
     unique_pairs: list[dict[str, Any]] = []
     seen_pairs: set[tuple[int, str]] = set()
