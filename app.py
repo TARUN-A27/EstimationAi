@@ -2652,29 +2652,17 @@ def insert_regular_order_document(
 
             cursor.execute(
                 """
-                SELECT
-                    NVL(MAX(ID), 0),
-                    NVL(MAX(DOCID), 0)
+                SELECT NVL(MAX(ID), 0)
                 FROM REGULARORDER_PODOCUMENT
                 """
             )
-            maximum_id, maximum_docid = map(
-                int,
-                cursor.fetchone(),
-            )
+            maximum_id = int(cursor.fetchone()[0])
 
-            # A cancelled PO document is deleted from the table (a trigger
-            # archives it) but its DOCID stays issued, so the counter may sit
-            # ahead of the table maximum. Allocate from the counter, as the ERP
-            # does, so an issued DOCID is never reused. Only a counter behind
-            # the table would hand out a DOCID that already exists.
-            if configured_max_docid < maximum_docid:
-                raise DocumentValidationError(
-                    "PO DOCID counter mismatch: configuration "
-                    f"MAXDOCID is {configured_max_docid}, but the "
-                    f"table maximum is {maximum_docid}. "
-                    "Nothing was inserted"
-                )
+            # Like the ERP, the next DOCID is MAXDOCID + 1 from the locked
+            # configuration row and is not compared with the table. A cancelled
+            # PO document leaves the counter ahead of the table (its DOCID stays
+            # issued), which is normal. DOCID is unique in the table, so a
+            # counter that is ever behind it fails the INSERT below.
             maximum_docid = configured_max_docid
 
             processed_rows = []
@@ -2767,41 +2755,53 @@ def insert_regular_order_document(
                     "processing",
                     f"Inserting PO parent {order_index} of {len(order_numbers)}",
                 )
-                cursor.execute(
-                    """
-                    INSERT INTO REGULARORDER_PODOCUMENT (
-                        ID,
-                        DOCID,
-                        RORDERNO,
-                        FILENAME,
-                        BLOBIMAGE,
-                        FILEFORMAT,
-                        REMARKS,
-                        ENTRYDATETIME,
-                        SYSTEMNAME,
-                        ENTRYUSERCODE
-                    ) VALUES (
-                        :document_id,
-                        :document_docid,
-                        :order_no,
-                        :filename,
-                        :blob_data,
-                        '.pdf',
-                        :remarks,
-                        SYSDATE,
-                        :system_name,
-                        :entry_user_code
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO REGULARORDER_PODOCUMENT (
+                            ID,
+                            DOCID,
+                            RORDERNO,
+                            FILENAME,
+                            BLOBIMAGE,
+                            FILEFORMAT,
+                            REMARKS,
+                            ENTRYDATETIME,
+                            SYSTEMNAME,
+                            ENTRYUSERCODE
+                        ) VALUES (
+                            :document_id,
+                            :document_docid,
+                            :order_no,
+                            :filename,
+                            :blob_data,
+                            '.pdf',
+                            :remarks,
+                            SYSDATE,
+                            :system_name,
+                            :entry_user_code
+                        )
+                        """,
+                        document_id=document_id,
+                        document_docid=document_docid,
+                        order_no=order_no,
+                        filename=filename,
+                        blob_data=blob_data,
+                        remarks=remarks[:200],
+                        system_name=system_name[:50],
+                        entry_user_code=entry_user_code,
                     )
-                    """,
-                    document_id=document_id,
-                    document_docid=document_docid,
-                    order_no=order_no,
-                    filename=filename,
-                    blob_data=blob_data,
-                    remarks=remarks[:200],
-                    system_name=system_name[:50],
-                    entry_user_code=entry_user_code,
-                )
+                except oracledb.IntegrityError as exc:
+                    # ORA-00001: the only unique key on this table is DOCID.
+                    error = exc.args[0] if exc.args else None
+                    if getattr(error, "code", None) != 1:
+                        raise
+                    raise DocumentValidationError(
+                        f"PO DOCID {document_docid} (MAXDOCID + 1) already "
+                        "exists in REGULARORDER_PODOCUMENT, so "
+                        "REGULARORDER_PODOCUMENT_CONFIG.MAXDOCID is behind the "
+                        "table. A DBA must realign it. Nothing was inserted"
+                    ) from exc
 
                 processed_rows.append(
                     {
