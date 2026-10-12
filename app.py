@@ -2663,13 +2663,19 @@ def insert_regular_order_document(
                 cursor.fetchone(),
             )
 
-            if configured_max_docid != maximum_docid:
+            # A cancelled PO document is deleted from the table (a trigger
+            # archives it) but its DOCID stays issued, so the counter may sit
+            # ahead of the table maximum. Allocate from the counter, as the ERP
+            # does, so an issued DOCID is never reused. Only a counter behind
+            # the table would hand out a DOCID that already exists.
+            if configured_max_docid < maximum_docid:
                 raise DocumentValidationError(
                     "PO DOCID counter mismatch: configuration "
                     f"MAXDOCID is {configured_max_docid}, but the "
                     f"table maximum is {maximum_docid}. "
                     "Nothing was inserted"
                 )
+            maximum_docid = configured_max_docid
 
             processed_rows = []
             deleted_detail_row_count = 0
