@@ -2567,8 +2567,9 @@ def insert_regular_order_document(
                     "file_size_bytes": len(blob_data),
                 }
 
-            # Lock the counter before duplicate checks and allocation.
-            # This serializes concurrent uploads from LAN users.
+            # Serialize parent persistence so two concurrent uploads of one new
+            # order cannot both insert it. The configuration row is only this
+            # mutex here; its MAXDOCID value is neither read nor checked.
             record_workflow_event(
                 workflow,
                 "po_parent_counter_lock",
@@ -2582,15 +2583,7 @@ def insert_regular_order_document(
                 FOR UPDATE
                 """
             )
-            config_rows = cursor.fetchall()
-
-            if len(config_rows) != 1:
-                raise DocumentValidationError(
-                    "REGULARORDER_PODOCUMENT_CONFIG must contain "
-                    "exactly one row. Nothing was inserted"
-                )
-
-            configured_max_docid = int(config_rows[0][0])
+            cursor.fetchall()
             record_workflow_event(
                 workflow,
                 "po_parent_counter_lock",
@@ -2652,32 +2645,14 @@ def insert_regular_order_document(
 
             cursor.execute(
                 """
-                SELECT
-                    NVL(MAX(ID), 0),
-                    NVL(MAX(DOCID), 0)
+                SELECT NVL(MAX(ID), 0)
                 FROM REGULARORDER_PODOCUMENT
                 """
             )
-            maximum_id, maximum_docid = map(
-                int,
-                cursor.fetchone(),
-            )
-
-            # A cancelled PO document is deleted from the table (a trigger
-            # archives it) but its DOCID stays issued, so the counter may sit
-            # ahead of the table maximum. Allocate from the counter, as the ERP
-            # does, so an issued DOCID is never reused. Only a counter behind
-            # the table would hand out a DOCID that already exists.
-            if configured_max_docid < maximum_docid:
-                raise DocumentValidationError(
-                    "PO DOCID counter mismatch: configuration "
-                    f"MAXDOCID is {configured_max_docid}, but the "
-                    f"table maximum is {maximum_docid}. "
-                    "Nothing was inserted"
-                )
-            maximum_docid = configured_max_docid
+            maximum_id = int(cursor.fetchone()[0])
 
             processed_rows = []
+            issued_docids = []
             deleted_detail_row_count = 0
 
             for order_index, order_no in enumerate(order_numbers, start=1):
@@ -2753,7 +2728,6 @@ def insert_regular_order_document(
                     """
                 )
                 document_id = int(cursor.fetchone()[0])
-                document_docid = maximum_docid + 1
 
                 if document_id <= maximum_id:
                     raise DocumentValidationError(
@@ -2761,47 +2735,71 @@ def insert_regular_order_document(
                         f"current table maximum is {maximum_id}"
                     )
 
+                # DOCID comes from the same sequence as estimation and mixing
+                # documents. DOCID is unique in the table, so a sequence that is
+                # behind it fails the INSERT below instead of reusing a number.
+                cursor.execute(
+                    """
+                    SELECT EnquiryDocument_DocId_Seq.NEXTVAL
+                    FROM DUAL
+                    """
+                )
+                document_docid = int(cursor.fetchone()[0])
+
                 record_workflow_event(
                     workflow,
                     "po_parent_upsert",
                     "processing",
                     f"Inserting PO parent {order_index} of {len(order_numbers)}",
                 )
-                cursor.execute(
-                    """
-                    INSERT INTO REGULARORDER_PODOCUMENT (
-                        ID,
-                        DOCID,
-                        RORDERNO,
-                        FILENAME,
-                        BLOBIMAGE,
-                        FILEFORMAT,
-                        REMARKS,
-                        ENTRYDATETIME,
-                        SYSTEMNAME,
-                        ENTRYUSERCODE
-                    ) VALUES (
-                        :document_id,
-                        :document_docid,
-                        :order_no,
-                        :filename,
-                        :blob_data,
-                        '.pdf',
-                        :remarks,
-                        SYSDATE,
-                        :system_name,
-                        :entry_user_code
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO REGULARORDER_PODOCUMENT (
+                            ID,
+                            DOCID,
+                            RORDERNO,
+                            FILENAME,
+                            BLOBIMAGE,
+                            FILEFORMAT,
+                            REMARKS,
+                            ENTRYDATETIME,
+                            SYSTEMNAME,
+                            ENTRYUSERCODE
+                        ) VALUES (
+                            :document_id,
+                            :document_docid,
+                            :order_no,
+                            :filename,
+                            :blob_data,
+                            '.pdf',
+                            :remarks,
+                            SYSDATE,
+                            :system_name,
+                            :entry_user_code
+                        )
+                        """,
+                        document_id=document_id,
+                        document_docid=document_docid,
+                        order_no=order_no,
+                        filename=filename,
+                        blob_data=blob_data,
+                        remarks=remarks[:200],
+                        system_name=system_name[:50],
+                        entry_user_code=entry_user_code,
                     )
-                    """,
-                    document_id=document_id,
-                    document_docid=document_docid,
-                    order_no=order_no,
-                    filename=filename,
-                    blob_data=blob_data,
-                    remarks=remarks[:200],
-                    system_name=system_name[:50],
-                    entry_user_code=entry_user_code,
-                )
+                except oracledb.IntegrityError as exc:
+                    # ORA-00001: the only unique key on this table is DOCID.
+                    error = exc.args[0] if exc.args else None
+                    if getattr(error, "code", None) != 1:
+                        raise
+                    raise DocumentValidationError(
+                        f"PO DOCID {document_docid} from "
+                        "EnquiryDocument_DocId_Seq is already used in "
+                        "REGULARORDER_PODOCUMENT, so the sequence is behind "
+                        "the table. A DBA must advance it above the highest "
+                        "PO DOCID. Nothing was inserted"
+                    ) from exc
 
                 processed_rows.append(
                     {
@@ -2821,40 +2819,36 @@ def insert_regular_order_document(
                 )
 
                 maximum_id = document_id
-                maximum_docid = document_docid
+                issued_docids.append(document_docid)
 
             docid_by_order = {
                 row["regular_order_number"]: row["docid"]
                 for row in processed_rows
             }
 
-            record_workflow_event(
-                workflow,
-                "po_parent_counter_update",
-                "processing",
-                "Updating PO DOCID configuration",
-            )
-            cursor.execute(
-                """
-                UPDATE REGULARORDER_PODOCUMENT_CONFIG
-                SET MAXDOCID = :new_max_docid
-                WHERE MAXDOCID = :old_max_docid
-                """,
-                new_max_docid=maximum_docid,
-                old_max_docid=configured_max_docid,
-            )
-
-            if cursor.rowcount != 1:
-                raise DocumentValidationError(
-                    "Failed to update the PO DOCID counter. "
-                    "Nothing was inserted"
+            if issued_docids:
+                # Keep the ERP's counter (it allocates MAXDOCID + 1) at or above
+                # every DOCID issued here so the two never collide. It only
+                # ever moves up.
+                record_workflow_event(
+                    workflow,
+                    "po_parent_counter_update",
+                    "processing",
+                    "Advancing PO DOCID configuration to the highest issued DOCID",
                 )
-            record_workflow_event(
-                workflow,
-                "po_parent_counter_update",
-                "completed",
-                "PO DOCID configuration updated",
-            )
+                cursor.execute(
+                    """
+                    UPDATE REGULARORDER_PODOCUMENT_CONFIG
+                    SET MAXDOCID = GREATEST(NVL(MAXDOCID, 0), :highest_docid)
+                    """,
+                    highest_docid=max(issued_docids),
+                )
+                record_workflow_event(
+                    workflow,
+                    "po_parent_counter_update",
+                    "completed",
+                    "PO DOCID configuration advanced",
+                )
 
         # Commit the established parent-table workflow independently. Party,
         # certificate and extracted line checks cannot undo this transaction.
