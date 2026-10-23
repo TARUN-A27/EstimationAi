@@ -10,6 +10,7 @@ from __future__ import annotations
 import mimetypes
 import os
 import re
+import time
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -27,6 +28,10 @@ CONTENT_UNDERSTANDING_SOURCE = "azure_ai_content_understanding"
 
 class ContentAnalysisError(RuntimeError):
     """A safe, user-facing Content Understanding workflow failure."""
+
+
+class EmptyAnalysisError(ContentAnalysisError):
+    """Azure answered, but with no document content (it varies run to run)."""
 
 
 def _audit(
@@ -855,6 +860,11 @@ def _valid_mapping_reference(value: Any) -> bool:
     return bool(text and len(text) <= 100 and key)
 
 
+def _is_printed_stamp_header(row: list[str]) -> bool:
+    """True for the stamp's own header and nothing else: EST NO, LM NO."""
+    return "".join(identifier_key(cell) for cell in row) == "ESTNOLMNO"
+
+
 # A written note such as "Est: 176273" directly followed by its order number.
 # The EST label is mandatory; bare digits never qualify.
 _ESTIMATION_NOTE = re.compile(
@@ -882,14 +892,20 @@ def parse_markdown_estimation_mappings(
     result_data: Mapping[str, Any],
     *,
     ignored_page_numbers: set[int] | None = None,
+    ignored_estimates: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Parse bounded EST/order mapping tables, found by header or row shape.
 
     A page without such a table may instead carry an explicit written
-    "Est: ######" note followed by its order number.
+    "Est: ######" note followed by its order number. A row holding an EST but
+    no order is reported as "unassigned" (and still makes the scan conflict);
+    the caller may name ESTs to leave out entirely once it has checked them.
     """
+    ignored = {int(value) for value in ignored_estimates or ()}
+    unassigned: set[int] = set()
     pairs: list[dict[str, Any]] = []
     detected_count = 0
+    stamp_count = 0
     incomplete_count = 0
     for page_number, markdown in _markdown_pages(result_data):
         if ignored_page_numbers and page_number in ignored_page_numbers:
@@ -904,6 +920,9 @@ def parse_markdown_estimation_mappings(
             header_row_index, est_index = start
             width = max(map(len, rows))
             table_pair_count = 0
+            is_stamp = header_row_index >= 0 and _is_printed_stamp_header(
+                rows[header_row_index]
+            )
             for data_row in rows[header_row_index + 1 :]:
                 padded = [*data_row, *([""] * (width - len(data_row)))]
                 est_text = padded[est_index].strip()
@@ -914,12 +933,22 @@ def parse_markdown_estimation_mappings(
                     if table_pair_count:
                         break
                     continue
+                valid_estimate = re.fullmatch(r"\d{6}", est_text) is not None
+                if valid_estimate and int(est_text) in ignored:
+                    continue
+                if valid_estimate and not reference_text:
+                    unassigned.add(int(est_text))
                 if (
-                    re.fullmatch(r"\d{6}", est_text) is None
+                    not valid_estimate
                     or not _valid_mapping_reference(reference_text)
                 ):
                     incomplete_count += 1
+                    # A blank LM cell is still a stamp; any other bad row is not.
+                    is_stamp = is_stamp and valid_estimate and not reference_text
                     continue
+                is_stamp = is_stamp and bool(
+                    re.fullmatch(_ORDER_NUMBER, identifier_key(reference_text))
+                )
                 pairs.append(
                     {
                         "estimate_number": int(est_text),
@@ -928,6 +957,7 @@ def parse_markdown_estimation_mappings(
                     }
                 )
                 table_pair_count += 1
+            stamp_count += int(is_stamp and table_pair_count > 0)
         if not page_tables:
             pairs.extend(_handwritten_estimation_pairs(markdown))
 
@@ -953,8 +983,58 @@ def parse_markdown_estimation_mappings(
     return {
         "mappings": unique_pairs,
         "mapping_table_detected_count": detected_count,
+        "stamp_table_count": stamp_count,
         "mapping_conflict_count": conflict_count + incomplete_count,
+        "unassigned_estimates": sorted(unassigned),
     }
+
+
+_MIXING_DETAILS = re.compile(
+    r"mixing\s+details\s+for\s+est\.?\s*no\.?\s*[-:#]?\s*['\"]?\s*(\d{6})(?!\d)",
+    re.IGNORECASE,
+)
+
+
+def _mixing_detail_estimation_numbers(
+    result_data: Mapping[str, Any],
+    ignored_page_numbers: set[int] | None = None,
+) -> list[int]:
+    """ESTs that have a "Mixing Details For Est. No-" section in the PDF."""
+    found: list[str] = []
+    for page_number, markdown in _markdown_pages(result_data):
+        if ignored_page_numbers and page_number in ignored_page_numbers:
+            continue
+        found.extend(_MIXING_DETAILS.findall(markdown))
+    return [int(value) for value in ordered_unique(found)]
+
+
+def accept_selected_document_type(
+    analysis: dict[str, Any],
+    expected_document_type: str | None,
+    expected_est_no: int | None,
+) -> dict[str, Any]:
+    """Let one PDF serve as a mixing sheet when it really contains one.
+
+    An estimation report is often saved together with the mixing details of one
+    of its ESTs, and the AI then calls the whole file an estimation sheet. When
+    a mixing sheet was selected for an EST whose mixing details are in the PDF,
+    the PDF is used as that mixing sheet instead of being refused.
+    """
+    if (
+        expected_document_type == "mix"
+        and analysis["document_type"] == "estimation"
+        and expected_est_no is not None
+        and int(expected_est_no) in analysis["mixing_detail_estimation_numbers"]
+    ):
+        mixing = list(analysis["mixing_detail_estimation_numbers"])
+        return {
+            **analysis,
+            "document_type": "mix",
+            "estimation_numbers": mixing,
+            "document_estimation_numbers": mixing,
+            "combined_document": True,
+        }
+    return analysis
 
 
 def normalize_document_type(value: Any) -> str:
@@ -1002,15 +1082,21 @@ def normalize_content_understanding_result(
     result_data: Mapping[str, Any],
     *,
     expected_document_type: str | None = None,
+    ignored_estimation_numbers: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Convert the configured analyzer response to the production contract."""
+    """Convert the configured analyzer response to the production contract.
+
+    ``ignored_estimation_numbers`` are ESTs the caller has verified may be left
+    out (see analyze_uploaded_document); everything about them is dropped.
+    """
+    ignored = {int(value) for value in ignored_estimation_numbers or ()}
     if not isinstance(result_data, Mapping):
         raise ContentAnalysisError(
             "AI document analysis returned a malformed response"
         )
     contents = result_data.get("contents")
     if not isinstance(contents, list) or not contents:
-        raise ContentAnalysisError("AI document analysis returned no document content")
+        raise EmptyAnalysisError("AI document analysis returned no document content")
 
     type_values: list[str] = []
     primary_estimation_values: list[Any] = []
@@ -1107,6 +1193,7 @@ def normalize_content_understanding_result(
     mapping_table_scan = parse_markdown_estimation_mappings(
         result_data,
         ignored_page_numbers=supporting_page_numbers,
+        ignored_estimates=ignored,
     )
     if document_type == "unknown":
         if mapping_table_scan["mappings"]:
@@ -1115,6 +1202,19 @@ def normalize_content_understanding_result(
             expected_type = normalize_document_type(expected_document_type)
             if expected_type != "unknown":
                 document_type = expected_type
+    elif (
+        document_type in {"mix", "estimation"}
+        and mapping_table_scan["stamp_table_count"]
+    ):
+        # Only a purchase order carries the printed EST NO / LM NO stamp, so
+        # the stamp settles the type whatever the AI called the document (an
+        # export sale contract with the stamp was labelled "mix", and a PO
+        # "estimation", which got it skipped as an already inserted sheet).
+        # Whether its mapping is complete is the PO path's job, not the type's.
+        # Any other table that merely looks like a mapping does not count:
+        # stamp_table_count is exactly that header with an order number in
+        # every filled row.
+        document_type = "po"
 
     order_lines = parse_order_lines(
         result_data,
@@ -1126,12 +1226,20 @@ def normalize_content_understanding_result(
             normalize_estimation_number(value)
             for value in document_estimation_values
         )
-        if number is not None
+        if number is not None and number not in ignored
     )
-    semantic_mappings = parse_estimation_mappings(
+    semantic_unassigned: set[int] = set()
+    semantic_mappings = []
+    for mapping in parse_estimation_mappings(
         result_data,
         ignored_page_numbers=supporting_page_numbers,
-    )
+    ):
+        estimate = mapping.get("estimate_number")
+        if estimate is not None and int(estimate) in ignored:
+            continue
+        if estimate is not None and not mapping.get("reference_numbers"):
+            semantic_unassigned.add(int(estimate))
+        semantic_mappings.append(mapping)
     semantic_pairs: list[dict[str, Any]] = []
     semantic_pair_keys: set[tuple[int, str]] = set()
     semantic_candidate_estimates: set[int] = set()
@@ -1245,7 +1353,7 @@ def normalize_content_understanding_result(
             normalize_estimation_number(value)
             for value in primary_estimation_values
         )
-        if number is not None
+        if number is not None and number not in ignored
     )
     primary_estimation_number = (
         int(primary_estimation_numbers[0])
@@ -1260,7 +1368,7 @@ def normalize_content_understanding_result(
             normalize_estimation_number(value)
             for value in (line.get("estimate_number") or [])
         )
-        if number is not None
+        if number is not None and number not in ignored
     )
     mapping_estimation_numbers = ordered_unique(
         str(mapping["estimate_number"])
@@ -1359,6 +1467,15 @@ def normalize_content_understanding_result(
         "line_estimation_numbers": [
             int(value) for value in line_estimation_numbers
         ],
+        # ESTs a stamp or the AI lists with no order next to them. They are not
+        # mappings, but they make the result conflict until Oracle has said
+        # whether an order exists for them (see analyze_uploaded_document).
+        "unassigned_estimation_numbers": sorted(
+            {*mapping_table_scan["unassigned_estimates"], *semantic_unassigned}
+        ),
+        "mixing_detail_estimation_numbers": _mixing_detail_estimation_numbers(
+            result_data, supporting_page_numbers
+        ),
         "order_lines": order_lines,
         "party_names": parse_party_names(
             result_data,
@@ -1369,33 +1486,157 @@ def normalize_content_understanding_result(
     }
 
 
+# Azure's answers vary from run to run for the very same file: a stamp read once
+# is missed the next time, a PO is sometimes labelled a mixing sheet, and the
+# response is occasionally empty. An unusable result is therefore analysed once
+# more, but only when the first pass was quick: the worker is killed at 300 s.
+RETRY_ONLY_IF_FIRST_TOOK_UNDER_SECONDS = 90
+
+
+def _analysis_problem(normalized: Mapping[str, Any]) -> str | None:
+    """Why a finished analysis cannot be used, or None when it can."""
+    if not normalized["estimation_numbers"]:
+        return "no estimation number was extracted"
+    if normalized["document_type"] == "po" and normalized["mapping_conflict_count"]:
+        return "the EST-to-order mapping was incomplete or conflicting"
+    return None
+
+
+def _without_unassigned_estimations(
+    candidate: dict[str, Any],
+    raw_result: Mapping[str, Any],
+    expected_document_type: str | None,
+    estimates_without_orders: Any,
+    audit: Any,
+) -> dict[str, Any]:
+    """Set aside stamp rows whose EST has no order yet, once Oracle says so.
+
+    A stamp may list an estimation that has not become an order, so its LM cell
+    is rightly blank. That blocks the whole PO unless Oracle confirms that none
+    of those ESTs has an order; if even one does, nothing is dropped silently.
+    """
+    unassigned = candidate["unassigned_estimation_numbers"]
+    if not (
+        estimates_without_orders
+        and unassigned
+        and candidate["document_type"] == "po"
+        and candidate["mapping_conflict_count"]
+    ):
+        return candidate
+    try:
+        without_orders = {int(value) for value in estimates_without_orders(list(unassigned))}
+    except Exception:
+        return candidate  # a failed lookup never loosens anything
+    if without_orders != set(unassigned):
+        return candidate
+    relaxed = normalize_content_understanding_result(
+        raw_result,
+        expected_document_type=expected_document_type,
+        ignored_estimation_numbers=without_orders,
+    )
+    if relaxed["mapping_conflict_count"]:
+        return candidate
+    relaxed["ignored_unassigned_estimation_numbers"] = sorted(without_orders)
+    _audit(
+        audit,
+        "unassigned_estimation_check",
+        "completed",
+        f"{len(without_orders)} stamped EST(s) with no order in Oracle were set aside",
+        {"ignored_count": len(without_orders)},
+    )
+    return relaxed
+
+
 def analyze_uploaded_document(
     document_path: Path,
     *,
     expected_document_type: str | None = None,
     audit: Any = None,
+    estimates_without_orders: Any = None,
 ) -> dict[str, Any]:
-    """Single paid-analysis boundary used by every upload workflow."""
+    """Single paid-analysis boundary used by every upload workflow.
+
+    An unusable result (see _analysis_problem, or an empty response) is
+    analysed once more; a usable result always wins, otherwise the first
+    answer is kept so the caller reports exactly what it did before.
+    ``estimates_without_orders(list_of_est) -> set`` lets the caller (which owns
+    the database) say which ESTs have no order; see _without_unassigned_estimations.
+    """
     analyzer_id, config_name = analyzer_configuration(expected_document_type)
-    raw_result = analyze_po_document(
-        document_path,
-        analyzer_id=analyzer_id,
-        analyzer_config_name=config_name,
-        audit=audit,
-    )
-    try:
-        normalized = normalize_content_understanding_result(
-            raw_result,
-            expected_document_type=expected_document_type,
+
+    def attempt(first):
+        raw_result = analyze_po_document(
+            document_path,
+            analyzer_id=analyzer_id,
+            analyzer_config_name=config_name,
+            audit=audit,
         )
-    except ContentAnalysisError:
+        try:
+            return _without_unassigned_estimations(
+                normalize_content_understanding_result(
+                    raw_result,
+                    expected_document_type=expected_document_type,
+                ),
+                raw_result,
+                expected_document_type,
+                estimates_without_orders,
+                audit,
+            ), None
+        except EmptyAnalysisError as exc:
+            return None, exc
+        except ContentAnalysisError:
+            if first:
+                _audit(
+                    audit,
+                    "ai_normalization",
+                    "failed",
+                    "AI response normalization failed",
+                )
+            raise
+
+    started = time.monotonic()
+    normalized, empty_error = attempt(True)
+    problem = (
+        "the AI response was empty"
+        if normalized is None
+        else _analysis_problem(normalized)
+    )
+    if (
+        problem
+        and time.monotonic() - started <= RETRY_ONLY_IF_FIRST_TOOK_UNDER_SECONDS
+    ):
+        _audit(
+            audit,
+            "ai_retry",
+            "processing",
+            f"AI result unusable ({problem}); analysing the PDF once more",
+        )
+        try:
+            second, _ = attempt(False)
+        except ContentAnalysisError:
+            second = None  # a failed retry leaves the first answer standing
+        if second is not None and (
+            normalized is None or _analysis_problem(second) is None
+        ):
+            normalized = second
+        _audit(
+            audit,
+            "ai_retry",
+            "completed",
+            "Second AI analysis finished",
+            {
+                "usable": normalized is not None
+                and _analysis_problem(normalized) is None
+            },
+        )
+    if normalized is None:
         _audit(
             audit,
             "ai_normalization",
             "failed",
             "AI response normalization failed",
         )
-        raise
+        raise empty_error
     normalized["analyzer_configuration"] = config_name
     _audit(
         audit,
@@ -1445,6 +1686,15 @@ def analyze_uploaded_document(
                 normalized["line_estimation_numbers"]
             ),
             "order_line_count": len(normalized["order_lines"]),
+            "unassigned_estimation_count": len(
+                normalized["unassigned_estimation_numbers"]
+            ),
+            "ignored_unassigned_estimation_count": len(
+                normalized.get("ignored_unassigned_estimation_numbers") or []
+            ),
+            "mixing_detail_estimation_count": len(
+                normalized["mixing_detail_estimation_numbers"]
+            ),
         },
     )
     _audit(

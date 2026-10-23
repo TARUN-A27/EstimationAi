@@ -28,6 +28,7 @@ from pending_reports import (
     REGULAR_ORDER_ESTIMATION_DETAILS_QUERY,
 )
 from po_content_validation import (
+    accept_selected_document_type,
     analyze_uploaded_document,
     build_extracted_po_document_detail_result,
     empty_v32_field_validation_counts,
@@ -1415,6 +1416,27 @@ def existing_estimation_numbers(cursor, candidates: list[int]) -> list[int]:
     return [value for value in candidates if value in existing]
 
 
+def estimates_without_regular_orders(estimates: list[int]) -> set[int]:
+    """Which of these ESTs have no order in REGULARORDER (read-only)."""
+    estimates = unique(int(value) for value in estimates)
+    if not estimates:
+        return set()
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            binds = {f"est_{index}": value for index, value in enumerate(estimates)}
+            placeholders = ", ".join(f":{name}" for name in binds)
+            cursor.execute(
+                "SELECT DISTINCT ESTIMATIONNO FROM REGULARORDER "
+                f"WHERE ESTIMATIONNO IN ({placeholders})",
+                binds,
+            )
+            with_orders = {int(row[0]) for row in cursor.fetchall()}
+    finally:
+        connection.close()
+    return set(estimates) - with_orders
+
+
 def resolve_po_estimation_candidates(
     cursor,
     document_estimation_numbers: list[int],
@@ -1566,9 +1588,20 @@ def resolve_po_estimation_candidates(
         retained = mapped
 
     if not retained:
+        reasons = {
+            "NO_REGULARORDER_MAPPING": "has no order in REGULARORDER",
+            "AMBIGUOUS_REGULARORDER_MAPPING": "belongs to more than one order",
+            "SEMANTIC_ORDER_CONFLICT": "is stamped against a different order",
+        }
+        detail = "; ".join(
+            f"EST {item['estimation_no']} "
+            f"{reasons.get(item['reason'], item['reason'])}"
+            for item in rejected_estimations
+        )
         raise DocumentValidationError(
-            "No AI-extracted EST value maps uniquely to REGULARORDER. "
-            "Nothing was inserted"
+            "No AI-extracted EST value maps uniquely to REGULARORDER"
+            + (f" ({detail})" if detail else "")
+            + ". Nothing was inserted"
         )
 
     return {
@@ -3560,6 +3593,12 @@ def upload_files():
                             details,
                         )
                     ),
+                    estimates_without_orders=estimates_without_regular_orders,
+                )
+                analysis_result = accept_selected_document_type(
+                    analysis_result,
+                    expected_document_type,
+                    expected_est_no,
                 )
                 document_type = analysis_result["document_type"]
                 classification_source = analysis_result["analysis_source"]
