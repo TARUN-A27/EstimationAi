@@ -35,6 +35,7 @@ from po_content_validation import (
     fetch_certificate_master_entries,
     fetch_oracle_expected_rows,
     identifier_key,
+    stamped_order_matches,
 )
 from workflow_audit import WorkflowAuditStore
 from werkzeug.utils import secure_filename
@@ -1534,7 +1535,11 @@ def resolve_po_estimation_candidates(
         if (
             expected_order_no is not None
             and semantic_reference_keys
-            and not semantic_reference_keys.issubset(resolved_order_keys)
+            and not all(
+                key in resolved_order_keys
+                or stamped_order_matches(key, order_no)
+                for key in semantic_reference_keys
+            )
         ):
             rejected_estimations.append(
                 {
@@ -2157,9 +2162,16 @@ def insert_regular_order_document(
         content_result.get("mapping_conflict_count") or 0
     )
     if normalization_mapping_conflicts:
+        unassigned = content_result.get("unassigned_estimation_numbers") or []
+        detail = (
+            f" (EST {', '.join(str(value) for value in unassigned)} listed on "
+            "the stamp without an order number)"
+            if unassigned
+            else ""
+        )
         message = (
             "The document contains incomplete or conflicting EST-to-order "
-            "mapping evidence and requires review. Nothing was inserted"
+            f"mapping evidence and requires review{detail}. Nothing was inserted"
         )
         if workflow is not None:
             set_workflow_stage(

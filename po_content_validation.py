@@ -823,6 +823,15 @@ def _clean_order_reference(text: str) -> str:
     return tokens[0] if len(tokens) == 1 else text
 
 
+def _clean_estimation_cell(text: str) -> str:
+    """A stamp's EST cell read with a thousands comma: "180,101" -> "180101".
+
+    Only that exact shape is repaired; any other stray character inside the
+    digits ("17010 1") is a smudge, and a smudged EST must block, not be guessed.
+    """
+    return re.sub(r"^(\d{3}),(\d{3})$", r"\1\2", text.strip())
+
+
 def _mapping_table_start(rows: list[list[str]]) -> tuple[int, int] | None:
     """Locate a stamp table as (header row index, EST column).
 
@@ -840,7 +849,7 @@ def _mapping_table_start(rows: list[list[str]]) -> tuple[int, int] | None:
         est_index = next((i for i, cell in enumerate(cells) if cell), None)
         if (
             est_index is not None
-            and re.fullmatch(r"\d{6}", cells[est_index])
+            and re.fullmatch(r"\d{6}", _clean_estimation_cell(cells[est_index]))
             and re.fullmatch(
                 _ORDER_NUMBER,
                 identifier_key(
@@ -900,12 +909,15 @@ def parse_markdown_estimation_mappings(
     "Est: ######" note followed by its order number. A row holding an EST but
     no order is reported as "unassigned" (and still makes the scan conflict);
     the caller may name ESTs to leave out entirely once it has checked them.
+    A crossed-out entry, read as stray text with nothing in the LM cell, is
+    skipped and counted in "struck_rows".
     """
     ignored = {int(value) for value in ignored_estimates or ()}
     unassigned: set[int] = set()
     pairs: list[dict[str, Any]] = []
     detected_count = 0
     stamp_count = 0
+    struck_count = 0
     incomplete_count = 0
     for page_number, markdown in _markdown_pages(result_data):
         if ignored_page_numbers and page_number in ignored_page_numbers:
@@ -925,7 +937,7 @@ def parse_markdown_estimation_mappings(
             )
             for data_row in rows[header_row_index + 1 :]:
                 padded = [*data_row, *([""] * (width - len(data_row)))]
-                est_text = padded[est_index].strip()
+                est_text = _clean_estimation_cell(padded[est_index])
                 reference_text = _clean_order_reference(
                     "".join(cell.strip() for cell in padded[est_index + 1 :])
                 )
@@ -938,6 +950,18 @@ def parse_markdown_estimation_mappings(
                     continue
                 if valid_estimate and not reference_text:
                     unassigned.add(int(est_text))
+                if (
+                    est_text
+                    and not reference_text
+                    and not re.fullmatch(r"\d{5,7}", est_text)
+                ):
+                    # A crossed-out entry: the scribble is read as a stray "EST"
+                    # ("OH2", an 8-digit blot) with nothing in the LM cell. It names
+                    # no EST and no order, so it cannot become a mapping, and
+                    # the ESTs the document itself lists must still all be
+                    # covered by the pairs that remain.
+                    struck_count += 1
+                    continue
                 if (
                     not valid_estimate
                     or not _valid_mapping_reference(reference_text)
@@ -984,6 +1008,7 @@ def parse_markdown_estimation_mappings(
         "mappings": unique_pairs,
         "mapping_table_detected_count": detected_count,
         "stamp_table_count": stamp_count,
+        "struck_rows": struck_count,
         "mapping_conflict_count": conflict_count + incomplete_count,
         "unassigned_estimates": sorted(unassigned),
     }
@@ -1476,6 +1501,9 @@ def normalize_content_understanding_result(
         "mixing_detail_estimation_numbers": _mixing_detail_estimation_numbers(
             result_data, supporting_page_numbers
         ),
+        # Crossed-out stamp entries that were skipped (see
+        # parse_markdown_estimation_mappings); 0 unless the stamp was corrected.
+        "ignored_struck_row_count": mapping_table_scan["struck_rows"],
         "order_lines": order_lines,
         "party_names": parse_party_names(
             result_data,
@@ -1695,6 +1723,7 @@ def analyze_uploaded_document(
             "mixing_detail_estimation_count": len(
                 normalized["mixing_detail_estimation_numbers"]
             ),
+            "ignored_struck_row_count": normalized["ignored_struck_row_count"],
         },
     )
     _audit(
@@ -1739,6 +1768,28 @@ def analyze_uploaded_document(
 
 def identifier_key(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+# Handwritten order numbers are often misread: the letter O for the digit 0
+# ("OM019900" for OMO19900) and M, H and N for one another ("OH29900" for
+# OM29900). Those readings, and only those, are accepted when a stamped order is
+# compared with the order Oracle holds. Checked on 2026-10-28 against all
+# 129,846 order numbers in REGULARORDER, they never make two different orders
+# look alike; any wider tolerance does (8,375 pairs, e.g. a DM and an LM order
+# with the same digits, or references that differ only by a letter suffix).
+_LOOKALIKE_LETTERS = "MHN"
+
+
+def stamped_order_matches(stamped: Any, order_no: Any) -> bool:
+    """Does an order number read from handwriting name this order?"""
+    read = identifier_key(stamped).replace("O", "0")
+    real = identifier_key(order_no).replace("O", "0")
+    if not read or not real or len(read) != len(real):
+        return False
+    wrong = [(a, b) for a, b in zip(read, real) if a != b]
+    return not wrong or (
+        len(wrong) == 1 and all(c in _LOOKALIKE_LETTERS for c in wrong[0])
+    )
 
 
 def sanitize_order_lines(
